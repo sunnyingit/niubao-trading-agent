@@ -128,6 +128,8 @@ def sector_layers(flow: float | None, heat: float | None, lever: float | None) -
 MONEY_ENTER, MONEY_HOLD = 1.0, 0.5       # 钱：进入 / 维持（滞后）
 MONEY_ENTER_BASE = 1.3                   # BASE（行业资金估算）进入门槛更严
 PRICE_ENTER, PRICE_HOLD = 1.0, 0.5       # 价：标准化超额收益的进入 / 维持
+OWN_RET_UP = 0.0                         # 自身近窗涨跌≥0 才允许叫「涨」
+OWN_RET_DOWN = -0.01                     # 自身近窗跌过 1% 直接偏「跌」
 SECTOR_HOT, SECTOR_COLD = 1.25, 0.85     # 相对沪深 300 的成交放大倍数
 POS_HIGH, POS_LOW = 0.8, 0.25            # 收盘在近 60 日区间的位置
 PHASE_CONFIRM = 2                        # 连续这么多天满足新条件才切换状态
@@ -138,18 +140,18 @@ PRICE_EX = PRICE_ENTER
 # 展示分组：键、标题、色调
 BUCKETS = (
     ("main", "强势主升 · 含待资金/换手", "good"),
-    ("next", "钱先到或潜伏", "blue"),
+    ("next", "净申购先到或潜伏", "blue"),
     ("dip", "价在跌、钱却在进 · 左侧", "warn"),
     ("hot_only", "派发 / 高位分歧 / 涨势没钱", "warn"),
     ("out", "退潮或钱在撤", "bad"),
     ("flat", "跟涨、观望、弱势", "flat"),
 )
 MEANING = {
-    "主升": "价涨又热，钱也在进：现在最强的一类。",
-    "主升·待资金": "价涨又热，但钱还没明显进来。行情在，资金待确认。",
-    "换手上行": "价涨又热，钱在出，但位置还不高：更像换手，不是高位派发。",
-    "钱先到": "价在涨、还没放量，钱已经进：钱先到，等热度跟上。",
-    "跟涨": "价在涨、不热，钱也平：跟着大盘涨，不是资金推动。",
+    "主升": "自身在涨、相对大盘也强，又热，钱也在进：现在最强的一类。",
+    "主升·待资金": "自身在涨又热，但钱还没明显进来。行情在，资金待确认。",
+    "换手上行": "自身在涨又热，钱在出，但位置还不高：更像换手，不是高位派发。",
+    "净申购先到": "自身在涨、成交还不热，但净申购已经起来：资金先到，等热度跟上。无代表 ETF 时看行业净流入。",
+    "跟涨": "自身在涨、不热，钱也平：跟着大盘涨，不是资金推动。",
     "涨势没钱": "缓涨里钱在出：涨靠惯性，资金没跟上。",
     "潜伏": "钱进了，价格和热度还没起来。可能是下一个，也可能只是慢热。",
     "高位分歧": "高位放量、价格没方向，钱进或走平：多空分歧大，小心见顶。",
@@ -182,10 +184,24 @@ def money_side(score: float | None, prev: str = "平", enter: float = MONEY_ENTE
     return "平"
 
 
-def price_side(score: float | None, prev: str = "平", enter: float = PRICE_ENTER, hold: float = PRICE_HOLD) -> str:
-    """价涨 / 跌 / 平。口径与钱相同的进入/维持滞后。"""
+def price_side(score: float | None, prev: str = "平", enter: float = PRICE_ENTER, hold: float = PRICE_HOLD,
+               own_ret: float | None = None) -> str:
+    """价涨 / 跌 / 平。
+
+    主看相对沪深 300（score）；再卡自身近窗涨跌：
+    - 自身 < OWN_RET_UP（默认 0）：不能叫「涨」，进不了强势主升；
+    - 自身 ≤ OWN_RET_DOWN（默认 −1%）：直接偏「跌」。
+    """
     word = money_side(score, {"涨": "进", "跌": "出"}.get(prev, "平"), enter, hold)
-    return {"进": "涨", "出": "跌"}.get(word, "平")
+    side = {"进": "涨", "出": "跌"}.get(word, "平")
+    if own_ret is None:
+        return side
+    ret = float(own_ret)
+    if ret <= OWN_RET_DOWN:
+        return "跌"
+    if ret < OWN_RET_UP and side == "涨":
+        return "平"
+    return side
 
 
 def heat_flag(heat: float | None) -> str:
@@ -227,7 +243,7 @@ def sector_phase(money: str, price: str, heat: str, pos: float | None, lever_wor
             phase, bucket, verdict = (("派发", "hot_only", "派发") if high else ("换手上行", "main", "换手上行"))
     elif weather == "缓涨":
         if money == "进":
-            phase, bucket, verdict = "钱先到", "next", "钱先到"
+            phase, bucket, verdict = "净申购先到", "next", "净申购先到"
         elif money == "平":
             phase, bucket, verdict = "跟涨", "flat", "没方向"
         else:
@@ -273,7 +289,11 @@ def sector_phase(money: str, price: str, heat: str, pos: float | None, lever_wor
 
 
 def sticky_phases(raw: list[dict], need: int = PHASE_CONFIRM) -> list[dict]:
-    """按时间顺序确认状态：新 phase 需连续 need 日才采纳。"""
+    """按时间顺序确认状态：新 phase 默认需连续 need 日才采纳。
+
+    进入主升要确认（防抖）；退出主升当天改口（自身已跌/钱已走时，不要还挂在「强势主升」里）。
+    其余粘滞期间：数字跟最新一天；why/meaning 标明「仍记旧相位 / 此刻更像」。
+    """
     if not raw:
         return []
     confirmed = [raw[0]]
@@ -287,24 +307,65 @@ def sticky_phases(raw: list[dict], need: int = PHASE_CONFIRM) -> list[dict]:
         while j >= 0 and raw[j]["phase"] == row["phase"]:
             streak += 1
             j -= 1
-        if streak >= need:
+        # 退出 main 桶：当天改口；进入或其他切换：仍要连续 need 日
+        req = 1 if confirmed[-1].get("bucket") == "main" and row.get("bucket") != "main" else need
+        if streak >= req:
             confirmed.append({**row})
+            continue
+        kept = confirmed[-1]
+        now_weather = row.get("weather") or kept.get("weather", "")
+        now_money = row.get("money") or kept.get("money", "平")
+        sticky = f"相位仍记「{kept.get('phase')}」（要连续 {req} 日才改口）；此刻更像「{row.get('phase')}」"
+        why = _why_bits(
+            row.get("mz"), row.get("price_z"), row.get("heat"), row.get("pos"),
+            now_weather, now_money, row.get("rate"),
+            kept.get("phase", ""), row.get("lever_word") or "—",
+        )
+        if why:
+            why = why + "。" + sticky
         else:
-            kept = confirmed[-1]
-            # 状态仍用上一确认态；最新 Mz / 热度等数字跟上，避免详情和格子对不上
-            confirmed.append({
-                **kept,
-                "mz": row.get("mz", kept.get("mz")),
-                "price_z": row.get("price_z", kept.get("price_z")),
-                "heat": row.get("heat", kept.get("heat")),
-                "ex5": row.get("ex5", kept.get("ex5")),
-                "rate": row.get("rate", kept.get("rate")),
-                "pos": row.get("pos", kept.get("pos")),
-                "why": _why_bits(row.get("mz"), row.get("price_z"), row.get("heat"), row.get("pos"),
-                                 kept.get("weather", ""), kept.get("money", "平"), row.get("rate"),
-                                 kept.get("phase", ""), row.get("lever_word") or "—"),
-            })
+            why = sticky
+        meaning = sticky + "。" + (row.get("meaning") or MEANING.get(str(row.get("phase") or ""), "") or kept.get("meaning") or "")
+        confirmed.append({
+            **kept,
+            "mz": row.get("mz", kept.get("mz")),
+            "price_z": row.get("price_z", kept.get("price_z")),
+            "heat": row.get("heat", kept.get("heat")),
+            "ex5": row.get("ex5", kept.get("ex5")),
+            "rate": row.get("rate", kept.get("rate")),
+            "pos": row.get("pos", kept.get("pos")),
+            "why": why,
+            "meaning": meaning.rstrip("。") + "。",
+            "pending_phase": row.get("phase"),
+        })
     return confirmed
+
+
+def _money_why(mz: float, rate) -> str:
+    """资金白话：不是买入成交量，是净申购/主力净流入相对自己平时偏多少。"""
+    abs_n = abs(float(mz))
+    if abs_n < 1:
+        plain = "资金进出和自己平时差不多"
+    elif abs_n > 3:
+        plain = f"资金比平时明显在{'进' if mz > 0 else '出'}"
+    else:
+        plain = f"资金比平时偏{'进' if mz > 0 else '出'}"
+    bit = f"{plain}（{mz:+.1f}）"
+    if rate is not None:
+        bit += f"；近几日净申购约占规模 {float(rate) * 100:+.1f}%"
+    return bit
+
+
+def _price_why(price_z: float) -> str:
+    """相对大盘白话：超额＝板块涨跌减去沪深300，不是「额外赚钱」。"""
+    abs_n = abs(float(price_z))
+    if abs_n < 1:
+        plain = "涨跌跟沪深300差不多"
+    elif abs_n > 3:
+        plain = f"比沪深300明显{'强' if price_z > 0 else '弱'}"
+    else:
+        plain = f"比沪深300偏{'强' if price_z > 0 else '弱'}"
+    return f"{plain}（{price_z:+.1f}）"
 
 
 def _why_bits(mz, price_z, heat_ratio, pos, weather: str, money: str, rate, phase: str, lever_word_: str) -> str:
@@ -313,17 +374,17 @@ def _why_bits(mz, price_z, heat_ratio, pos, weather: str, money: str, rate, phas
     cold = heat_ratio is not None and heat_ratio <= SECTOR_COLD
     bits = []
     if mz is not None:
-        bits.append(f"钱 Mz {mz:+.1f}" + ("" if rate is None else f"（近几日份额占规模 {rate * 100:+.1f}%）"))
+        bits.append(_money_why(float(mz), rate))
     if price_z is not None:
-        bits.append(f"超额 Mz {price_z:+.1f}")
+        bits.append(_price_why(float(price_z)))
     if heat_ratio is not None:
-        bits.append(f"相对沪深300 热度 {heat_ratio:.2f}×")
+        bits.append(f"成交活跃度约是沪深300的 {float(heat_ratio):.2f} 倍")
     if pos is not None:
         bits.append("位置偏高" if high else "位置偏低" if low else "位置适中")
     if lever_word_ in ("回升", "下降"):
         bits.append(f"行业两融{lever_word_}")
     if weather and money:
-        bits.append(f"行情 {weather} · 钱{money}")
+        bits.append(f"行情{weather} · 资金{money}")
     suffix = ""
     base = phase.split("·")[0] if phase else ""
     if phase == "主升·待资金":
@@ -412,8 +473,8 @@ def watch_action(phase: str | None, lean: str | None, bucket: str | None = None,
         if name == "主升·待资金" or verdict == "待资金":
             return "可持有不加仓", "行情强势，但钱还没明显进来"
         return ("顺势持有", "板块处于主升一侧，个股也偏多") if bullish else ("板块有利，等个股", "板块在主升一侧，个股还没转强")
-    if bucket == "next" or name in ("钱先到", "潜伏"):
-        return "等价格确认", "钱先到或在潜伏，等价格和热度确认"
+    if bucket == "next" or name in ("净申购先到", "潜伏"):
+        return "等价格确认", "净申购先到或在潜伏，等价格和热度确认"
     if bucket == "dip" or name in ("抄底拉锯", "逆势申购"):
         return "左侧观察，等放量止跌", "价在跌、钱在进，先当左侧信号"
     if name == "派发" or verdict == "派发":

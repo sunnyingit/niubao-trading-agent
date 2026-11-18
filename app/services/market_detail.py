@@ -116,9 +116,20 @@ def project_facts(summary: dict) -> list[dict]:
             if pct is None:
                 bits.append(name)
             else:
-                bits.append(f"{name} {float(pct) * 100:+.1f}%".replace("+", "+").replace("-", "−"))
+                # pct 来自指数日线 pct_chg，已是百分数（如 -0.87 = −0.87%）
+                bits.append(f"{name} {float(pct):+.1f}%".replace("-", "−"))
         if bits:
             facts.append(_fact("mk.index.tape", "主要指数", "指数", "；".join(bits)))
+
+    analyst = summary.get("analyst") if isinstance(summary.get("analyst"), dict) else {}
+    if analyst.get("index_streak"):
+        facts.append(_fact("mk.index.streak", "指数轨迹", "指数", str(analyst["index_streak"])))
+    if analyst.get("trend"):
+        facts.append(_fact("mk.index.trend", "指数趋势", "趋势", str(analyst["trend"])))
+    if analyst.get("rebound"):
+        facts.append(_fact("mk.index.rebound", "位置与反弹", "趋势", str(analyst["rebound"])))
+    if analyst.get("money_with_tape"):
+        facts.append(_fact("mk.money.with_tape", "同期宽基", "资金", str(analyst["money_with_tape"])))
 
     money = summary.get("money") if isinstance(summary.get("money"), dict) else {}
     if money.get("summary"):
@@ -149,9 +160,17 @@ def project_facts(summary: dict) -> list[dict]:
             "情绪",
             f"{mood.get('label') or ''}：{mood['summary']}".strip("："),
         ))
+    if analyst.get("mood_stage"):
+        facts.append(_fact("mk.mood.stage", "情绪阶段", "情绪", str(analyst["mood_stage"])))
+    if analyst.get("breadth_structure"):
+        facts.append(_fact("mk.breadth.structure", "市场宽度", "宽度", str(analyst["breadth_structure"])))
 
     sectors = summary.get("sectors") if isinstance(summary.get("sectors"), dict) else {}
-    if sectors.get("headline"):
+    if analyst.get("style_rotation"):
+        facts.append(_fact("mk.style.rotation", "风格轮动", "风格", str(analyst["style_rotation"])))
+    elif sectors.get("headline"):
+        facts.append(_fact("mk.sector.headline", "市场板块", "板块", str(sectors["headline"])))
+    if sectors.get("headline") and analyst.get("style_rotation") and sectors["headline"] != analyst.get("style_rotation"):
         facts.append(_fact("mk.sector.headline", "市场板块", "板块", str(sectors["headline"])))
 
     return facts

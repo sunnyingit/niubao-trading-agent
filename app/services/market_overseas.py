@@ -76,13 +76,36 @@ def _us_as_of(now: datetime) -> str:
     return f"{day.month:02d}-{day.day:02d} 收盘"
 
 
-def _http_json(url: str) -> dict:
+def _http_json(url: str, timeout: float = 5.0) -> dict:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json,text/plain,*/*",
+            "Connection": "close",
+        },
     )
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_network_fail(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        tip in text
+        for tip in (
+            "remote end closed",
+            "connection reset",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "nodename nor servname",
+            "name or service not known",
+            "network is unreachable",
+            "connection refused",
+        )
+    )
 
 
 def _scale_em(v):
@@ -132,32 +155,36 @@ def _fetch_eastmoney(secids: str) -> list[dict]:
 
     params = f"fltt=2&fields={_FIELDS}&secids={secids}"
     last_error: Exception | None = None
+    network_down = False
+    # 东财偶发直接掐连接：少试几次，尽快交给腾讯补源，避免市场页卡在「正在取」。
     for host in _HOSTS:
-        for _attempt in range(2):
-            try:
-                body = _http_json(f"{host}?{params}")
-                rows = ((body or {}).get("data") or {}).get("diff") or []
-                if rows:
-                    cache.set(key, rows, TTL)
-                    cache.set(key + ":stale", rows, STALE)
-                    return rows
-                last_error = RuntimeError("外盘没有返回行情")
-            except Exception as exc:
-                last_error = exc
-            time.sleep(0.35)
-        time.sleep(0.25)
-
-    # ulist 全挂：逐个 stock/get
-    singles: list[dict] = []
-    for secid in secids.split(","):
-        row = _fetch_eastmoney_one(secid.strip())
-        if row:
-            singles.append(row)
+        try:
+            body = _http_json(f"{host}?{params}", timeout=4.0)
+            rows = ((body or {}).get("data") or {}).get("diff") or []
+            if rows:
+                cache.set(key, rows, TTL)
+                cache.set(key + ":stale", rows, STALE)
+                return rows
+            last_error = RuntimeError("外盘没有返回行情")
+        except Exception as exc:
+            last_error = exc
+            if _is_network_fail(exc):
+                network_down = True
+                break
         time.sleep(0.2)
-    if singles:
-        cache.set(key, singles, TTL)
-        cache.set(key + ":stale", singles, STALE)
-        return singles
+
+    # 网络挂了就别逐票拖时间；空响应才尝试单票兜底。
+    if not network_down:
+        singles: list[dict] = []
+        for secid in secids.split(",")[:8]:
+            row = _fetch_eastmoney_one(secid.strip())
+            if row:
+                singles.append(row)
+            time.sleep(0.12)
+        if singles:
+            cache.set(key, singles, TTL)
+            cache.set(key + ":stale", singles, STALE)
+            return singles
 
     cache.set(key + ":fail", True, FAIL_COOLDOWN)
     stale = cache.get(key + ":stale")
@@ -431,19 +458,23 @@ def build(now: datetime | None = None, extra: str | list[str] | None = None, nam
     try:
         em = _index_em(_fetch_eastmoney(secids))
     except Exception as exc:
-        errors.append(str(exc))
+        # 对用户只提示可恢复，不把底层断连原文甩到卡片上
+        if _is_network_fail(exc):
+            errors.append("东财外盘暂时连不上，已改用备用源")
+        else:
+            errors.append("东财外盘这一轮没取全")
 
     need_tx = []
     for secid, _group, _name, tx_sym in fetch_list:
         code = secid.split(".", 1)[-1]
         if tx_sym and not (em.get(code) or em.get(secid)):
             need_tx.append(tx_sym)
-    # 东财偶发只回一半时也补一遍腾讯
+    # 东财整表失败时 em 为空，上面已收齐；再兜底一次防漏
     if not need_tx and errors:
         need_tx = [tx for *_rest, tx in fetch_list if tx]
     tx = _fetch_tencent(need_tx) if need_tx else {}
     if need_tx and not tx:
-        errors.append("腾讯外盘补源也没有取到")
+        errors.append("备用行情源也没有取到，请稍后点重试")
 
     # 默认三组只放内置清单；用户新加的一律进 extra，避免目录和自选搅在一起
     us = [_row(meta, em, tx, now) for meta in _WATCH if meta[1] == "us"]

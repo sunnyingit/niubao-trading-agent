@@ -115,6 +115,7 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(team.label_of("托市", 1, 0.4, True, False), "托市中")
         self.assertEqual(team.label_of("托市", 8, 0.02, False, False), "钱还在")
         self.assertEqual(team.label_of("托市", 8, 0.18, False, False), "部分回落")
+        self.assertEqual(team.label_of("托市", 8, 0.4, False, False), "部分回落")  # 回落再大也不单独判撤
         self.assertEqual(team.label_of("托市", 8, 0.4, True, False), "可能在撤")
         self.assertEqual(team.label_of("异动", 1, None, False, False, "sell"), "异动中")
         self.assertEqual(team.label_of("异动", 8, 0.04, False, False, "sell"), "还没回补")
@@ -190,10 +191,47 @@ class SummarizeTest(unittest.TestCase):
     def test_shares_given_back_after_the_fifth_day_are_a_possible_exit(self):
         shares, closes, pct, days = _market(n=129, spike_at=120, give=0.4)
         pct[days[-1]] = -2.0
-        out = team.summarize(shares, closes, pct)
+        # 显式给高位指数：末日大跌不会把近 60 日分位压到阈值以下
+        index = {day: 100 + i * 0.3 for i, day in enumerate(days)}
+        out = team.summarize(shares, closes, pct, index)
         self.assertEqual(out["label"], "可能在撤")
         self.assertGreater(out["hold"]["gone"], 0.3)
         self.assertTrue(out["sell"]["sign1"])
+        self.assertGreaterEqual(out["sell"]["pos_pctile"], team.POS_HIGH)
+
+    def test_peak_drop_alone_is_not_a_possible_exit(self):
+        shares, closes, pct, days = _market(n=129, spike_at=120, give=0.55)
+        index = {day: 100 - i * 0.4 for i, day in enumerate(days)}
+        out = team.summarize(shares, closes, pct, index)
+        self.assertEqual(out["label"], "部分回落")
+        self.assertGreater(out["hold"]["gone"], out["hold"]["hard"])
+        self.assertTrue(out.get("sell") is None or not out["sell"].get("sign1"))
+        self.assertIn("托市后份额回落较多，尚未满足高位短减", out["marks"])
+
+    def test_high_position_and_short_drain_is_a_possible_exit(self):
+        # 承压日净减：不会记成卖出异动，last 仍是托市；指数收盘另行抬高位
+        days = _days(140)
+        shares, closes = {}, {}
+        for code in ("510300.SH", "510050.SH"):
+            level, rows, bars = 100000.0, [], []
+            for i, day in enumerate(days):
+                if i == 120:
+                    level *= 1.04
+                elif i >= 135:
+                    level *= 0.985
+                elif i:
+                    level *= 1.001 if i % 2 else 0.999
+                rows.append({"trade_date": day, "fd_share": level})
+                bars.append({"trade_date": day, "close": 1.0, "amount": 1})
+            shares[code], closes[code] = rows, bars
+        pct = {day: (-2.0 if i == 120 else (-1.2 if i >= 135 else 0.2)) for i, day in enumerate(days)}
+        index = {day: 80 + i * 0.25 for i, day in enumerate(days)}
+        out = team.summarize(shares, closes, pct, index)
+        self.assertEqual(out["label"], "可能在撤")
+        self.assertEqual(out["last"]["state"], "托市")
+        self.assertTrue(out["sell"]["sign1"])
+        self.assertGreaterEqual(out["sell"]["pos_pctile"], team.POS_HIGH)
+        self.assertGreaterEqual(len(out["sell"]["drain_groups"]), 2)
 
     def test_broad_redemptions_on_calm_days_are_the_second_sign(self):
         days = _days(140)
@@ -297,7 +335,7 @@ class PlainWordsTest(unittest.TestCase):
             self.assertNotIn(jargon, text)
 
     def test_wave_is_shown_as_a_range_with_peak_day(self):
-        from app.services.market_page import _team_event, _last_facts, _wave_when
+        from app.services.market_page import _team_act_story, _team_event, _last_facts, _wave_when
 
         wave = {
             "day": "2026-10-15", "until": "2026-11-06", "span": 16, "found": "2026-10-16",
@@ -308,8 +346,43 @@ class PlainWordsTest(unittest.TestCase):
         self.assertEqual(_wave_when(wave, "托市"), "10-15 到 11-06 这一波托市")
         text = _team_event(wave)
         self.assertIn("10-15 到 11-06 这一波托市", text)
+        self.assertIn("10-16 份额确认", text)
+        self.assertIn("起点当天上证大跌 1.6%", text)
+        self.assertNotIn("起点那天上证", text)
+        self.assertIn("涉及 沪深300、上证50、创业板", text)
         self.assertIn("11-03", text)
         self.assertIn("779", text)
+        mild = _team_act_story(wave, [
+            {"k": "1 日", "v": "−0.9"}, {"k": "3 日", "v": "−1.2"}, {"k": "5 日", "v": "−1.0"},
+            {"k": "30 日", "v": "+4.2"},
+        ])
+        self.assertIn("申赎和平时差不多", mild)
+        self.assertNotIn("同方向、隔不超过", mild)
+        self.assertNotIn("现在宽基偏不偏", mild)
+        self.assertNotIn("30 日", mild)
+        self.assertNotIn("−0.9", mild)
+
+        swung = _team_act_story(wave, [
+            {"k": "1 日", "v": "−0.9"}, {"k": "3 日", "v": "−1.6"}, {"k": "5 日", "v": "−1.5"},
+        ])
+        self.assertIn("偏在卖出", swung)
+        self.assertIn("向下波动", swung)
+
+        long_down = [{"index_pct": -0.5} for _ in range(3)]
+        warn = _team_act_story(
+            wave,
+            [{"k": "1 日", "v": "−1.8"}, {"k": "3 日", "v": "−2.0"}, {"k": "5 日", "v": "−1.7"}],
+            {"series": long_down, "pressure": "连跌"},
+        )
+        self.assertIn("大盘已经跌了一阵还在卖", warn)
+        self.assertIn("重点留意", warn)
+        ten_day = [{"index_pct": -0.4}] * 6 + [{"index_pct": 0.3}] * 4
+        warn10 = _team_act_story(
+            wave,
+            [{"k": "1 日", "v": "−1.8"}, {"k": "3 日", "v": "−1.6"}, {"k": "5 日", "v": "−1.7"}],
+            {"series": ten_day},
+        )
+        self.assertIn("重点留意", warn10)
         keys = {row["k"]: row["v"] for row in _last_facts(wave)}
         self.assertEqual(keys["这一波"], "10-15～11-06")
         self.assertEqual(keys["最大一天"], "11-03")
@@ -322,8 +395,13 @@ class PlainWordsTest(unittest.TestCase):
         text = _team_headline({"label": "部分回落", "last": self.LAST, "hold": {"gone": 0.18, "gap_yi": 12}, "sell": None})
         self.assertIn("已回落 18%", text)
         self.assertIn("12 亿份", text)
-        gone = _team_headline({"label": "可能在撤", "last": self.LAST, "hold": {"gone": 0.4}, "sell": {"sign1": True, "sign2": False}})
-        self.assertIn("超过 3 成", gone)
+        gone = _team_headline({
+            "label": "可能在撤", "last": self.LAST, "hold": {"gone": 0.4},
+            "sell": {"sign1": True, "sign2": False, "pos_pctile": 0.82, "confirm_gone": True},
+        })
+        self.assertIn("位置约 82%", gone)
+        self.assertIn("近 5 日份额显著净减", gone)
+        self.assertIn("作确认", gone)
         self.assertIn("散户赎回", gone)
 
     def test_no_action_and_statement(self):

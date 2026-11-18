@@ -132,6 +132,20 @@ def modified_z(value: float | None, center: float | None, mad: float | None) -> 
     return MZ_K * (value - center) / mad
 
 
+def _mz_daily_series(values: list[float], dates: list[str], keep: int = 30) -> list[dict]:
+    """逐日 1 日 Mz：当天值对照此前近 60 日中位数/MAD。正偏高、负偏低。"""
+    if len(values) != len(dates) or len(values) <= BASELINE_DAYS:
+        return []
+    out = []
+    for i in range(BASELINE_DAYS, len(values)):
+        med, mad, enough = _baseline(values[:i])
+        z = modified_z(values[i], med, mad) if enough else None
+        if z is None:
+            continue
+        out.append({"date": dates[i], "mz": round(float(z), 2)})
+    return out[-keep:]
+
+
 def _window(windows: dict, n: int):
     if not isinstance(windows, dict):
         return None
@@ -367,6 +381,28 @@ def _margin_rates(days: list[str], by_day: dict) -> tuple[list[float], list[floa
     return rates, nets
 
 
+def _margin_mz_daily(days: list[str], by_day: dict, keep: int = 30) -> list[dict]:
+    """余额日变化率的逐日 1 日 Mz；附带当日净买入（亿）方便对照，二者口径不同。"""
+    rate_dates, rates, nets = [], [], []
+    for prev, day in zip(days, days[1:]):
+        if _day_gap(prev, day) > 4:
+            continue
+        base = by_day[prev]["rzye"]
+        if not base:
+            continue
+        rate_dates.append(_iso(day))
+        rates.append(by_day[day]["rzye"] / base - 1)
+        nets.append((by_day[day]["rzmre"] - by_day[day]["rzche"]) / 1e8)
+    points = _mz_daily_series(rates, rate_dates, keep)
+    net_of = dict(zip(rate_dates, nets))
+    for row in points:
+        net = net_of.get(row["date"])
+        if net is not None:
+            row["net"] = round(float(net), 2)
+            row["net_label"] = "融资净买入"
+    return points
+
+
 def _judge_margin_book(days: list[str], by_day: dict) -> tuple[str, list[int], str, list[str]]:
     rates, nets = _margin_rates(days, by_day)
     got = {}
@@ -400,12 +436,24 @@ def format_turnover(rows: list[dict], index_pct: dict[str, float] | None = None,
     if len(rows) < 6:
         return _body([], "没有取到足够的全市场成交额")
     latest = rows[-1]
-    amounts = [_num(row.get("amount")) for row in rows]
-    amounts = [item for item in amounts if item and item > 0]
-    logs = [math.log(item) for item in amounts]
+    paired = [
+        (_iso(row.get("trade_date")), math.log(amount), amount)
+        for row in rows
+        if (amount := _num(row.get("amount"))) and amount > 0
+    ]
+    dates_log = [item[0] for item in paired]
+    logs = [item[1] for item in paired]
+    amounts = [item[2] for item in paired]
     avg60 = _mean(rows[-60:], "amount")
     windows = {n: None if not avg60 else _mean(rows[-n:], "amount") / avg60 - 1 for n in SPANS}
     sides, scores, baseline_short = _turnover_sides(logs)
+    mz_daily = _mz_daily_series(logs, dates_log, 30)
+    # amount 与卡片一致，单位已是亿元
+    amt_of = {d: a for d, a in zip(dates_log, amounts)}
+    for row in mz_daily:
+        amt = amt_of.get(row["date"])
+        if amt is not None:
+            row["amount"] = round(float(amt), 2)
     label = judge_turnover_votes(sides, (sides.get(1, "没有"), _prior_day_side(logs)))
     votes = [n for n in (1, 3, 5, 30) if sides.get(n) == label and label in ("冷清", "活跃")]
     ratio5 = windows[5]
@@ -432,6 +480,7 @@ def format_turnover(rows: list[dict], index_pct: dict[str, float] | None = None,
         "avg60": avg60,
         "windows": windows,
         "mz": scores,
+        "mz_daily": mz_daily,
         "pctile": pctile,
         "label": label,
         "votes": votes,
@@ -551,11 +600,20 @@ def _etf_series(shares: dict[str, list[dict]]) -> dict:
         series.append({"date": _iso(day), "value": total, "delta": delta})
     windows = {n: _growth(totals[-1], totals[-1 - n]) if len(totals) > n else None for n in SPANS}
     last_gap = _day_gap(days[-2], days[-1])
+    # 日变化相对自身常态的 1 日 Mz（和判定用的份额变化方向一致）
+    day_dates = [_iso(day) for day in days]
+    mz_daily = _mz_daily_series(day_changes, day_dates, 30)
+    delta_of = dict(zip(day_dates, day_changes))
+    for row in mz_daily:
+        delta = delta_of.get(row["date"])
+        if delta is not None:
+            row["delta"] = round(float(delta), 2)
     return {
         "series": series[-60:],
         "total": totals[-1],
         "day_change": None if last_gap > 4 else day_changes[-1],
         "windows": windows,
+        "mz_daily": mz_daily,
         "pctile": _pctile(totals[-240:], totals[-1]),
         "latest_date": _iso(days[-1]),
         "items": [_etf_item(code, shares.get(code) or []) for code in codes],
@@ -622,6 +680,8 @@ def format_margin(rows: list[dict], turnover: float | None = None) -> dict:
         "net": net / 1e8,
         "share": share,
         "pctile": _pctile([by_day[day]["rzye"] for day in days[-240:]], latest["rzye"]),
+        # 与判定同源：融资余额日变化率的 1 日 Mz（不是余额水平，也不是当日净买入）
+        "mz_daily": _margin_mz_daily(days, by_day),
         "series": [
             {"date": _iso(day), "value": by_day[day]["rzye"] / 1e8,
              "delta": (by_day[day]["rzmre"] - by_day[day]["rzche"]) / 1e8}
@@ -838,6 +898,7 @@ def monthly_funds(rows: list[dict], today: date) -> list[dict]:
 def format_breadth(today_rows: list[dict], history: dict[str, list[float]]) -> dict:
     up = down = flat = 0
     highs = lows = 0
+    above20 = above60 = known20 = known60 = 0
     for row in today_rows:
         pct = _num(row.get("pct_chg"))
         if pct is None:
@@ -851,16 +912,36 @@ def format_breadth(today_rows: list[dict], history: dict[str, list[float]]) -> d
         code = str(row.get("ts_code") or "")
         close = _num(row.get("close"))
         past = history.get(code) or []
-        if close is None or len(past) < 20:
+        if close is None:
             continue
-        if close >= max(past):
-            highs += 1
-        if close <= min(past):
-            lows += 1
+        if len(past) >= 20:
+            known20 += 1
+            window20 = past[-20:]
+            if close >= max(window20):
+                highs += 1
+            if close <= min(window20):
+                lows += 1
+            if close >= sum(window20) / 20:
+                above20 += 1
+        if len(past) >= 60:
+            known60 += 1
+            window60 = past[-60:]
+            if close >= sum(window60) / 60:
+                above60 += 1
     if not (up or down):
         return _body([], "没有取到涨跌家数")
     text = f"上涨 {up} 家，下跌 {down} 家，平盘 {flat} 家。近 25 个交易日新高 {highs} 家，新低 {lows} 家。"
-    return _body([{"id": "mkt.breadth", "text": text}], text, {"up": up, "down": down, "flat": flat, "highs": highs, "lows": lows})
+    if known20:
+        text += f"全 A 约 {round(above20 / known20 * 100)}% 站上 20 日线"
+        if known60:
+            text += f"、约 {round(above60 / known60 * 100)}% 站上 60 日线"
+        text += "。"
+    return _body([{"id": "mkt.breadth", "text": text}], text, {
+        "up": up, "down": down, "flat": flat, "highs": highs, "lows": lows,
+        "above_ma20": above20, "ma20_n": known20, "above_ma60": above60, "ma60_n": known60,
+        "above_ma20_share": (above20 / known20) if known20 else None,
+        "above_ma60_share": (above60 / known60) if known60 else None,
+    })
 
 
 def board_limit(ts_code: str) -> int | None:
@@ -1325,7 +1406,8 @@ def _breadth(today: date) -> dict:
         if today_rows:
             break
     history: dict[str, list[float]] = {}
-    dates = [item for item in _open_dates(today, 26) if item < day][-24:]
+    # 60 日均线占比需要更长收盘序列；日线按日缓存，冷启动会稍慢一次。
+    dates = [item for item in _open_dates(today, 65) if item < day][-60:]
     for rows in _parallel(dates, _daily_rows):
         for row in rows:
             close = _num(row.get("close"))

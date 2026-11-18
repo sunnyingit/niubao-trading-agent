@@ -67,9 +67,12 @@ class PromptTest(unittest.TestCase):
 
     def test_chief_reads_the_dimension_verdicts_and_must_name_an_observable_signal(self):
         self.assertIn("dimensions", prompts.CHIEF_SYSTEM)
+        self.assertIn("证据裁决引擎", prompts.CHIEF_SYSTEM)
         self.assertIn("能观察到的信号", prompts.CHIEF_SYSTEM)
         self.assertIn("宁可写不明", prompts.CHIEF_SYSTEM)
         self.assertIn("flow.vs_self", prompts.CHIEF_SYSTEM)
+        self.assertIn("禁止先看五人结论再凑证据", prompts.CHIEF_SYSTEM)
+        self.assertIn("不参与分差", prompts.CHIEF_SYSTEM)
 
     def test_flow_rubric_judges_by_comparison_with_the_stock_itself(self):
         from app.flow_review import prompt
@@ -91,7 +94,7 @@ class PromptTest(unittest.TestCase):
         from app.fundamental_review import prompt as fund
         from app.sector_review import prompt as sector
         self.assertEqual((flow.PROMPT_VERSION, fin.PROMPT_VERSION, sector.PROMPT_VERSION, fund.PROMPT_VERSION, prompts.PROMPT_VERSION),
-                         ("flow-review-15", "fin-review-12", "sector-review-6", "fund-review-7", "prompt-12"))
+                         ("flow-review-16", "fin-review-12", "sector-review-7", "fund-review-7", "prompt-13"))
 
     def test_the_fundamental_prompt_no_longer_lets_the_model_invent_partners(self):
         from app.fundamental_review import prompt

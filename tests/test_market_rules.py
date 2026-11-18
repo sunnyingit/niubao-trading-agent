@@ -287,12 +287,19 @@ class MoodNotesTest(unittest.TestCase):
     def test_theme_break_and_theme_words(self):
         from app.services.market_page import _mood_notes, _theme_view
 
-        last = {"themes": [{"name": "半导体", "n": 19}, {"name": "贵金属", "n": 11}, {"name": "元件", "n": 7}], "theme_share": 0.32, "theme_follow": -2.0, "theme_n": 14}
+        last = {"themes": [{"name": "半导体", "n": 19}, {"name": "贵金属", "n": 11}, {"name": "元件", "n": 7}], "theme_share": 0.32, "theme_follow": -2.0, "theme_n": 14, "follow": -1.5}
         self.assertEqual(_theme_view(last)["word"], "主线在退")
         self.assertIn("半导体 19 家、贵金属 11 家、元件 7 家", _theme_view(last)["detail"])
-        self.assertEqual(_theme_view({**last, "theme_follow": 1.0, "theme_share": 0.4})["word"], "有主线")
+        self.assertEqual(_theme_view({**last, "theme_follow": 1.0, "theme_share": 0.4, "follow": 0.5})["word"], "有主线")
+        # 前三够集中，但昨涨停整体还在亏钱 → 只算有集中，不报有主线
+        clustered = _theme_view({**last, "theme_follow": 1.2, "theme_share": 0.35, "follow": -1.54})
+        self.assertEqual(clustered["word"], "有集中")
+        self.assertEqual(clustered["tone"], "flat")
+        self.assertIn("集中不等于能赚钱的主线", clustered["detail"])
+        # 主线自己翻绿（未到 −1.5% 大面线）也只算有集中
+        self.assertEqual(_theme_view({**last, "theme_follow": -0.4, "theme_share": 0.4, "follow": 0.5})["word"], "有集中")
         self.assertEqual(_theme_view({**last, "theme_follow": None, "theme_share": 0.18})["word"], "没主线")
-        self.assertEqual(_theme_view({**last, "theme_follow": 0.5})["word"], "一般")
+        self.assertEqual(_theme_view({**last, "theme_follow": 0.5, "follow": 0.2})["word"], "一般")
         self.assertIsNone(_theme_view({"themes": []}))
         self.assertIn("主线大面", " ".join(_mood_notes(self.indexes(), {}, {}, {"last": last})))
 
@@ -415,7 +422,7 @@ class SectorPhaseTest(unittest.TestCase):
         self.assertEqual(self.phase("出", "涨", "热", pos=0.9)["phase"], "派发")
 
     def test_slow_rise_and_no_direction(self):
-        self.assertEqual(self.phase("进", "涨", "不热")["phase"], "钱先到")
+        self.assertEqual(self.phase("进", "涨", "不热")["phase"], "净申购先到")
         self.assertEqual(self.phase("平", "涨", "不热")["phase"], "跟涨")
         self.assertEqual(self.phase("出", "涨", "不热")["phase"], "涨势没钱")
         self.assertEqual(self.phase("进", "平", "不热")["phase"], "潜伏")
@@ -440,6 +447,15 @@ class SectorPhaseTest(unittest.TestCase):
         self.assertIn("抛压在衰竭", out["why"])
         self.assertEqual(self.phase("出", "平", "不热")["phase"], "钱在撤")
 
+    def test_why_bits_use_plain_words(self):
+        text = rules._why_bits(0.4, -1.0, 1.49, 0.2, "强势", "平", 0.004, "主升·待资金", "—")
+        self.assertIn("资金进出和自己平时差不多", text)
+        self.assertIn("净申购约占规模", text)
+        self.assertIn("比沪深300偏弱", text)
+        self.assertIn("成交活跃度", text)
+        self.assertNotIn("钱 Mz", text)
+        self.assertNotIn("超额 Mz", text)
+
     def test_money_hysteresis_and_sticky_phase(self):
         self.assertEqual(rules.money_side(0.6, "平"), "平")
         self.assertEqual(rules.money_side(1.1, "平"), "进")
@@ -457,6 +473,45 @@ class SectorPhaseTest(unittest.TestCase):
         # 换手上行 / 净流入为负 / 钱出：都不算刚启动
         self.assertFalse(rules.pulse_flags(["flat", "main", "main"], mz=-1.5, heat=1.5, phase="换手上行", flow=-2.0)[0])
         self.assertFalse(rules.pulse_flags(["flat", "main", "main"], mz=-0.2, heat=1.3, phase="主升·待资金", flow=-0.3)[0])
+
+    def test_price_side_needs_own_sector_return(self):
+        """相对大盘再强，自身在跌也不能叫涨，进不了强势。"""
+        self.assertEqual(rules.price_side(1.5, "平", own_ret=0.01), "涨")
+        self.assertEqual(rules.price_side(1.5, "平", own_ret=-0.005), "平")
+        self.assertEqual(rules.price_side(1.5, "平", own_ret=-0.02), "跌")
+        self.assertEqual(rules.weather_of("平", "热"), "分歧")
+        self.assertNotEqual(
+            rules.sector_phase("进", "平", "热", 0.5, mz=1.5, price_z=1.5, heat_ratio=1.5)["phase"],
+            "主升",
+        )
+
+    def test_exit_main_same_day_keep_enter_sticky(self):
+        """退出主升当天改口；进入主升仍要连续 2 日。"""
+        main = rules.sector_phase("进", "涨", "热", 0.5, mz=2.0, price_z=1.5, heat_ratio=1.8, rate=0.02)
+        ebb = rules.sector_phase("出", "跌", "热", 0.5, mz=-1.4, price_z=-1.2, heat_ratio=1.9, rate=-0.04)
+        weak = rules.sector_phase("平", "跌", "热", 0.2, mz=0.4, price_z=-1.0, heat_ratio=1.5, rate=0.004)
+        # 退出 main → 当天改口
+        leave = rules.sticky_phases([
+            {**main, "mz": 2.0, "price_z": 1.5, "heat": 1.8, "rate": 0.02, "pos": 0.5},
+            {**main, "mz": 1.6, "price_z": 1.2, "heat": 1.7, "rate": 0.01, "pos": 0.5},
+            {**ebb, "mz": -1.4, "price_z": -1.2, "heat": 1.9, "rate": -0.04, "pos": 0.5},
+        ])[-1]
+        self.assertEqual(leave["phase"], "退潮")
+        self.assertEqual(leave["bucket"], "out")
+        # 待资金 → 弱势：也是退出 main，当天改口
+        leave2 = rules.sticky_phases([
+            {**rules.sector_phase("平", "涨", "热", 0.2, mz=0.4, price_z=1.2, heat_ratio=1.5, rate=0.004),
+             "mz": 0.4, "price_z": 1.2, "heat": 1.5, "rate": 0.004, "pos": 0.2},
+            {**weak, "mz": 0.4, "price_z": -1.0, "heat": 1.5, "rate": 0.004, "pos": 0.2},
+        ])[-1]
+        self.assertEqual(leave2["phase"], "弱势")
+        # 进入 main 仍粘滞一天
+        enter = rules.sticky_phases([
+            {"phase": "观望", "bucket": "flat", "weather": "无方向", "money": "平", "meaning": ""},
+            {**main, "mz": 2.0, "price_z": 1.5, "heat": 1.8, "rate": 0.02, "pos": 0.5},
+        ])[-1]
+        self.assertEqual(enter["phase"], "观望")
+        self.assertIn("相位仍记「观望」", enter["why"])
 
     def test_every_bucket_has_a_title_and_tone(self):
         keys = [item[0] for item in rules.BUCKETS]
@@ -491,18 +546,80 @@ class SectorPageTest(unittest.TestCase):
         self.assertEqual(rows[0]["meaning"], "价涨又热，钱也在进：现在最强的一类。")
         self.assertEqual([item["key"] for item in _sector_buckets(rows)], ["main", "hot_only", "out", "flat"])
         headline = _sector_headline(rows)
-        # 摘要与四格同口径：F 待资金热但钱不够，不进「钱进 · 热」
-        self.assertIn("钱进 · 热：D、C", headline)
-        self.assertIn("钱出 · 热：E", headline)
-        self.assertIn("钱出 · 不热：B", headline)
-        self.assertNotIn("F", headline)
+        # D/C 可跟 → 值得跟踪；E/B 在出 → 偏危险；F 钱弱不进跟踪
+        self.assertIn("值得跟踪：", headline)
+        self.assertIn("D", headline)
+        self.assertIn("偏危险：", headline)
+        self.assertTrue("E" in headline or "B" in headline)
         self.assertNotIn("观望", headline)
+
+    def test_rising_hot_only_is_not_worth_tracking(self):
+        from app.services.market_page import _sector_headline, _sector_rows
+
+        # 高位分歧可进在攻，但不进今日关注 → 摘要写「在攻未进推荐」
+        raw = {
+            "rows": [{
+                "name": "银行", "code": "x", "industry": "", "group": "金融", "source": "etf",
+                "flow": {5: 5.0}, "flow_rate": None, "size": None, "money_z": 3.0, "price_z": 0.3,
+                "up_days": 2, "ret5": 0.01, "ret20": 0.0, "ex5": 0.0, "ex20": 0.0, "heat": 1.5,
+                "position": 0.85, "lever": None, "lever_word": "—", "verdict": "高位分歧",
+                "phase": "高位分歧", "tone": "warn", "bucket": "hot_only", "why": "", "weather": "分歧",
+                "started": False, "fading": False, "mz_hist": [], "price_z_hist": [],
+            }],
+            "conclusion_days": 5,
+        }
+        text = _sector_headline(_sector_rows(raw))
+        self.assertIn("在攻未进推荐：银行", text)
+        self.assertNotIn("值得跟踪：", text)
 
     def test_empty_and_quiet_headlines(self):
         from app.services.market_page import _sector_headline
 
         self.assertEqual(_sector_headline([]), "没有取到板块数据")
-        self.assertIn("没有拉开差距", _sector_headline([{"name": "A", "bucket": "flat", "money_z": 0.1, "heat": 1.0}]))
+        quiet = _sector_headline([{"name": "A", "bucket": "flat", "money_z": 0.1, "heat": 1.0, "ret5": 0.0, "flow": 0.0}])
+        self.assertTrue("先别急着追" in quiet or "轮动不鲜明" in quiet)
+
+    def test_sector_picks_skip_falling_and_dip(self):
+        from app.services.market_page import _sector_dip_watch, _sector_picks, _sector_rows
+
+        raw = self.sectors()
+        # C 深跌不进推荐；G 为 next 可盯；H 为 dip 只进左侧观察
+        # I 相位 next 但近几日净流出，不进推荐（避免假「净申购先到」）
+        raw["rows"].append({
+            "name": "G", "code": "x", "industry": "", "group": "科技", "source": "etf", "flow": {5: 1.0},
+            "flow_rate": None, "size": None, "money_z": 1.5, "ret5": 0.005, "ret20": 0.0, "ex5": 0.0, "ex20": 0.0,
+            "heat": 1.0, "position": 0.4, "lever": None, "lever_word": "—", "verdict": "净申购先到", "tone": "good",
+            "phase": "净申购先到", "bucket": "next", "why": "why", "meaning": "",
+        })
+        raw["rows"].append({
+            "name": "H", "code": "x", "industry": "", "group": "科技", "source": "etf", "flow": {5: 2.0},
+            "flow_rate": None, "size": None, "money_z": 1.8, "ret5": -0.03, "ret20": 0.0, "ex5": 0.0, "ex20": 0.0,
+            "heat": 1.1, "position": 0.3, "lever": None, "lever_word": "—", "verdict": "逆势申购", "tone": "warn",
+            "phase": "逆势申购", "bucket": "dip", "why": "why", "meaning": "",
+        })
+        raw["rows"].append({
+            "name": "I", "code": "x", "industry": "", "group": "科技", "source": "etf", "flow": {5: -44.8},
+            "flow_rate": None, "size": None, "money_z": 0.3, "ret5": -0.009, "ret20": 0.0, "ex5": 0.0, "ex20": 0.0,
+            "heat": 1.1, "position": 0.4, "lever": None, "lever_word": "—", "verdict": "净申购先到", "tone": "good",
+            "phase": "净申购先到", "bucket": "next", "why": "why", "meaning": "",
+        })
+        for row in raw["rows"]:
+            if row["name"] == "C":
+                row["ret5"] = -0.02
+        rows = _sector_rows(raw)
+        picks = _sector_picks(rows)
+        names = [item["name"] for item in picks]
+        self.assertIn("D", names)
+        self.assertIn("F", names)
+        self.assertIn("G", names)
+        self.assertNotIn("C", names)
+        self.assertNotIn("H", names)
+        self.assertNotIn("I", names)
+        self.assertEqual(picks[0]["tier"], "follow")
+        self.assertEqual([item["name"] for item in picks if item["tier"] == "watch"], ["G"])
+        dips = _sector_dip_watch(rows)
+        self.assertEqual([item["name"] for item in dips], ["H"])
+        self.assertEqual(dips[0]["label"], "左侧")
 
     def test_sector_changes_do_not_nag_about_no_direction(self):
         from app.services import market_changes as ch

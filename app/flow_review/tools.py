@@ -24,13 +24,14 @@ from app.services.volume_flow.rules import (
     price_flow_relation,
 )
 
-WINDOWS = frozenset({3, 5, 10, 20})
+WINDOWS = frozenset({3, 5, 10, 20, 60})
 LOOKBACKS = frozenset({10, 20})
 DAYS_OPTS = frozenset({30, 60, 120})
 BASE_WINDOWS = frozenset({3, 5, 10})
 HORIZONS = {
     "short": {"window": 3, "lookback": PATH_LOOKBACK_SHORT},
     "swing": {"window": 20, "lookback": PATH_LOOKBACK_SWING},
+    "medium": {"window": 60, "lookback": PATH_LOOKBACK_SWING},
 }
 
 # 诊断摘要 ≤50 字；reply 场景不卡此上限（由调用方 mode 区分）
@@ -45,7 +46,7 @@ def resolve_horizon(horizon: str | None = None, window: int | None = None, lookb
     """horizon=short → window=3；也可显式传 window/lookback（须在白名单）。"""
     hz = (horizon or "short").strip().lower()
     if hz not in HORIZONS:
-        raise ToolError(f"horizon 只能是 short/swing，收到 {horizon!r}")
+        raise ToolError(f"horizon 只能是 short/swing/medium，收到 {horizon!r}")
     defaults = HORIZONS[hz]
     win = defaults["window"] if window is None else int(window)
     lb = defaults["lookback"] if lookback is None else int(lookback)
@@ -147,7 +148,7 @@ def compare_price_flow(aligned: dict, window: int | None = None, horizon: str | 
 
 
 def summarize_flow_windows(aligned: dict, windows: list[int] | None = None) -> dict:
-    chosen = list(windows) if windows else [3, 5, 10, 20]
+    chosen = list(windows) if windows else [3, 5, 10, 20, 60]
     if any(days not in WINDOWS for days in chosen):
         raise ToolError(f"windows 子集只能来自 {sorted(WINDOWS)}")
     rows = []
@@ -260,13 +261,13 @@ def diagnosis_headline(path: dict, level: dict, structure: dict, price: dict, *,
 # 给模型网关用的 JSON Schema 摘要（实现仍走上面的函数）
 TOOL_SPECS: list[dict[str, Any]] = [
     {"name": "get_flow_daily", "params": {"days": "30|60|120"}},
-    {"name": "compute_flow_path", "params": {"horizon": "short|swing", "lookback": "10|20"}},
-    {"name": "compute_flow_level", "params": {"horizon": "short|swing", "window": "3|5|10|20"}},
-    {"name": "compute_flow_structure", "params": {"horizon": "short|swing", "window": "3|5|10|20"}},
-    {"name": "compare_price_flow", "params": {"horizon": "short|swing", "window": "3|5|10|20"}},
-    {"name": "summarize_flow_windows", "params": {"windows": "subset of 3,5,10,20"}},
-    {"name": "get_tier_breakdown", "params": {"horizon": "short|swing", "window": "3|5|10|20"}},
-    {"name": "get_sector_flow_context", "params": {"horizon": "short|swing", "window": "3|5|10|20"}},
+    {"name": "compute_flow_path", "params": {"horizon": "short|swing|medium", "lookback": "10|20"}},
+    {"name": "compute_flow_level", "params": {"horizon": "short|swing|medium", "window": "3|5|10|20|60"}},
+    {"name": "compute_flow_structure", "params": {"horizon": "short|swing|medium", "window": "3|5|10|20|60"}},
+    {"name": "compare_price_flow", "params": {"horizon": "short|swing|medium", "window": "3|5|10|20|60"}},
+    {"name": "summarize_flow_windows", "params": {"windows": "subset of 3,5,10,20,60"}},
+    {"name": "get_tier_breakdown", "params": {"horizon": "short|swing|medium", "window": "3|5|10|20|60"}},
+    {"name": "get_sector_flow_context", "params": {"horizon": "short|swing|medium", "window": "3|5|10|20|60"}},
     {"name": "get_last_day_focus", "params": {"base_window": "3|5|10"}},
 ]
 

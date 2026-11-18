@@ -77,13 +77,26 @@ def fetch(stocks: list[Stock], fetch_text: Callable[[list[str]], str] | None = N
     return result
 
 
+# 宽基指数不在上市个股表里；搜索「创业板指」等名称时要能直接命中。
+_KNOWN_INDEXES = (
+    {"ts_code": "000001.SH", "code": "000001", "name": "上证指数", "industry": "指数", "aliases": ("上证", "上证综指", "沪指")},
+    {"ts_code": "399001.SZ", "code": "399001", "name": "深证成指", "industry": "指数", "aliases": ("深成", "深成指", "深指")},
+    {"ts_code": "399006.SZ", "code": "399006", "name": "创业板指", "industry": "指数", "aliases": ("创业板", "创业板指数", "创指")},
+    {"ts_code": "000300.SH", "code": "000300", "name": "沪深300", "industry": "指数", "aliases": ("HS300",)},
+    {"ts_code": "000905.SH", "code": "000905", "name": "中证500", "industry": "指数", "aliases": ()},
+    {"ts_code": "000852.SH", "code": "000852", "name": "中证1000", "industry": "指数", "aliases": ()},
+    {"ts_code": "000016.SH", "code": "000016", "name": "上证50", "industry": "指数", "aliases": ()},
+    {"ts_code": "000688.SH", "code": "000688", "name": "科创50", "industry": "指数", "aliases": ("科创板指",)},
+)
+
+
 def search(
     query: str,
     limit: int = 8,
     listed: Callable[[], list[dict]] | None = None,
     hk_listed: Callable[[], list[dict]] | None = None,
 ) -> list[dict]:
-    """按名称包含、或代码前缀匹配。名称开头匹配的排在前面。A 股和港股放在同一个结果里。"""
+    """按名称包含、或代码前缀匹配。名称开头匹配的排在前面。A 股、港股和常见指数放在同一个结果里。"""
     text = query.strip()
     if not text:
         return []
@@ -97,22 +110,24 @@ def search(
         pool.extend(hk_listed())
     except Exception:
         pass
+    pool.extend(_KNOWN_INDEXES)
     rows = []
     for row in pool:
-        name, symbol, ts_code = row["name"], row["symbol"], row["ts_code"]
+        name, symbol, ts_code = row["name"], row["symbol"] if "symbol" in row else row.get("code", ""), row["ts_code"]
         names = [name]
         fullname = row.get("fullname")
         if fullname:
             names.append(fullname)
-        if any(item.startswith(text) for item in names):
+        names.extend(row.get("aliases") or ())
+        if any(item.startswith(text) for item in names) or any(str(item).upper().startswith(upper) for item in names):
             rank = 0
-        elif any(text in item for item in names):
+        elif any(text in item for item in names) or any(upper in str(item).upper() for item in names):
             rank = 1
         elif _code_match(symbol, ts_code, text, upper):
             rank = 0
         else:
             continue
-        rows.append((rank, ts_code, {"ts_code": ts_code, "code": symbol, "name": name, "industry": row.get("industry")}))
+        rows.append((rank, ts_code, {"ts_code": ts_code, "code": symbol or ts_code.split(".")[0], "name": name, "industry": row.get("industry")}))
     rows.sort(key=lambda item: (item[0], item[1]))
     return [item[2] for item in rows[:limit]]
 

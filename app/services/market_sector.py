@@ -289,6 +289,20 @@ def window_return(closes: list[tuple[str, float]], n: int) -> float | None:
     return closes[-1][1] / closes[-1 - n][1] - 1
 
 
+def up_days(closes: list[tuple[str, float]]) -> int:
+    """连续收盘上涨天数：今天比昨天高算一天，严格大于才续上。"""
+    prices = [price for _day, price in closes if price is not None]
+    if len(prices) < 2:
+        return 0
+    streak = 0
+    for index in range(len(prices) - 1, 0, -1):
+        if prices[index] > prices[index - 1]:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 def price_score(closes: list[tuple[str, float]], bench: list[tuple[str, float]], n: int = CONCLUSION_DAYS,
                 history: int = HISTORY) -> tuple[float | None, float | None]:
     """返回 (超额 Mz, 原始 n 日超额)。相对沪深300 的日度超额累计后按 Modified Z-Score。"""
@@ -442,7 +456,8 @@ def make_row(name: str, group: str, code: str, source: str, series: dict, bench_
             "ret5": None, "ret20": None, "ex5": None, "ex20": None, "heat": None, "position": None,
             "lever": lever_value, "lever_word": rules.lever_word(lever_value),
             "verdict": None, "phase": "没数据", "tone": "flat", "bucket": "flat", "why": "历史数据不够，判不了。",
-            "weather": "", "price_z": None, "mz_hist": [], "price_z_hist": [],
+            "weather": "", "price_z": None, "up_days": up_days(series.get("closes") or []),
+            "mz_hist": [], "price_z_hist": [],
             "started": False, "fading": False, "bucket_hist": [],
         }
     enter = rules.MONEY_ENTER if source == "etf" else rules.MONEY_ENTER_BASE
@@ -453,15 +468,17 @@ def make_row(name: str, group: str, code: str, source: str, series: dict, bench_
     for end in range(start_i, len(daily_all)):
         sliced = _slice_series(series, end)
         mz, price_z, ex5, heat, rate = _scores_at(sliced, bench_closes, bench_amounts, source)
+        own_ret = window_return(sliced["closes"], CONCLUSION_DAYS)
         money = rules.money_side(mz, money_prev, enter, hold)
-        price = rules.price_side(price_z, price_prev)
+        price = rules.price_side(price_z, price_prev, own_ret=own_ret)
         heat_f = rules.heat_flag(heat)
         money_prev, price_prev = money, price
         pos = position(sliced["closes"])
         layers = rules.sector_phase(money, price, heat_f, pos, rules.lever_word(lever_value),
                                    mz=mz, price_z=price_z, heat_ratio=heat, rate=rate,
                                    cold=heat is not None and heat <= rules.SECTOR_COLD)
-        raw.append({**layers, "mz": mz, "price_z": price_z, "heat": heat, "ex5": ex5, "rate": rate, "pos": pos})
+        raw.append({**layers, "mz": mz, "price_z": price_z, "heat": heat, "ex5": ex5, "rate": rate,
+                    "pos": pos, "own_ret": own_ret})
     confirmed = rules.sticky_phases(raw)
     last = confirmed[-1] if confirmed else raw[-1]
     daily = [value for _day, value in daily_all]
@@ -484,6 +501,7 @@ def make_row(name: str, group: str, code: str, source: str, series: dict, bench_
         "verdict": last.get("verdict"), "phase": last.get("phase"), "tone": last.get("tone"), "bucket": last.get("bucket"),
         "why": last.get("why", ""), "weather": last.get("weather", ""), "meaning": last.get("meaning", ""),
         "price_z": last.get("price_z"),
+        "up_days": up_days(closes),
         "mz_hist": [row.get("mz") for row in confirmed[-6:]],
         "price_z_hist": [row.get("price_z") for row in confirmed[-6:]],
         "started": started, "fading": fading, "bucket_hist": [row["bucket"] for row in confirmed[-rules.PULSE_LOOKBACK - 1:]],

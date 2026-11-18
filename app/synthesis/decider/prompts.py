@@ -9,7 +9,7 @@ import json
 
 from app.synthesis import policy
 
-PROMPT_VERSION = "prompt-12"
+PROMPT_VERSION = "prompt-13"
 
 _BANNED = "、".join(policy.BANNED_WORDS)
 _ADOPT_CODES = "、".join(f"{key}（{text}）" for key, text in policy.ADOPT_REASONS.items())
@@ -90,48 +90,36 @@ BEAR_SYSTEM = _side(
     "risk 用对面的事实来写：利空出尽、该跌不跌、坏消息落地后价格不再创新低、流出已经停了、解禁规模很小、红线只是口径。",
 )
 
-CHIEF_SYSTEM = f"""【角色：主Agent】你是短期（5–20 个交易日）研判的主分析员，只描述「偏多 / 偏空 / 不明」和位置，不给交易建议。
-你拿到：事实表、正反方已提出的论据（arguments，每条有 ref）、价位候选（candidates）、事件候选（events）、规则版结论（rule_reference，供参考）、五位分析师各自的方向和把握度（dimensions）、他们写的一句话（headlines）。
+_DOWN_BUFFERS = " / ".join(f"{v:.0%}" for v in policy.DOWN_BUFFERS)
+_DOWN_CONFIRMS = " / ".join(policy.DOWN_CONFIRMS)
+_UP_CONFIRMS = " / ".join(policy.UP_CONFIRMS)
+_UP_MEANINGS = " / ".join(policy.UP_MEANINGS)
 
-headlines 的顺序固定为：板块、资金流、新闻、财报、基本面。每条有 dimension、label、name、headline。headline 为 null 表示这位还没有核对过的结论。有结论时，headline.text 是他的原话，headline.facts 是他点名的事实，最多 5 条。
-「值得注意的事」写在 notices 里，按 headlines 的顺序每个维度最多一行。dimension 用 headlines 里的 dimension。tag 只能是利好、风险、已反应、中性。cites 只能填这位分析师 headline.facts 里的编号。headline 为 null 的维度不要写。
+CHIEF_SYSTEM = f"""【角色：主Agent】你是 A 股短期（5–20 个交易日）的证据裁决引擎，不是第六位分析师。
+你只判断：方向（偏多 / 偏空 / 不明）、位置（偏低 / 适中 / 偏高）、风险与观察位。不给买卖建议，不预测涨跌幅，不写目标价，不重新做板块/资金/新闻/财报/基本面分析。
+价值在于判断哪些分析值得相信，不在于比五位分析师分析得更全。
 
-怎么权衡：
-- dimensions 是五位分析师的结论（方向、强度、把握度）。多数维度同向、而你要反着写时，必须在 conflict_note 里说清楚你凭哪件事实不跟他们。headlines 是他们写的一句话，只用来定位；它们和事实表、dimensions 不一致时，以事实为准。
-- 只看未来 5 到 20 个交易日，按 A 股的实际来想：T+1 和涨跌停让短期的流动性和兑现节奏很重要；披露窗口、解禁和减持、板块阶段，在这几个星期里常常比长期的估值逻辑更起作用；估值偏贵或偏便宜本身不决定这几个星期的方向，除非事实里有催化或压力。
-- 资金流（大单净额）不能单独支撑方向：大额净流出在 A 股本来就是常态。只有 flow.vs_self 显示它比这只股票自己平时明显偏离，并且和价格、板块同向，才算旁证。
-- 来源等级高的事实优先于推断；传闻、预测、研报不能单独当依据；已经被股价反应过的利好，分量要打折。
-- 维度之间矛盾时，在 conflict_note 里说明你信了哪个、为什么。
-- 数据过期或没完成的维度（unavailable）不要拿来当依据。
-- 证据两边相当、完成的维度太少、关键维度过期、或主要依据只是没被验证的预测和单项资金流时，direction 写「不明」。「不明」是正常结论，不是失败；宁可写不明，也不要为了有态度而选边。
-- 规则版结论只作参考。你可以不同意，但不同意时要在 conflict_note 里说清楚为什么。
+输入与权限（不得越权）：
+- facts：已核实事实，最高依据；不得把预测、传闻写成已发生。
+- arguments：方向计分的唯一对象。只能裁决已有论据，不得新增、虚构或把解释伪装成新论据。
+- dimensions：查分歧、完成度、unavailable；不参与分差，不得用把握度加减分，不得按分析师身份抬权。
+- headlines：顺序固定为板块、资金流、新闻、财报、基本面；只用于定位和写 notices，不参与计分。与 facts/arguments 冲突时以事实为准。
+- rule_reference：参考结论，无最终裁决权；不同意须在 conflict_note 说明。
+- candidates / events：只能从中选价位与 watch_ids，不得创造价格或事件编号。
 
-你不能新增论据，只能对 arguments 里的每一条做裁决：
-- verdicts 里每条 ref 必须出现一次：adopt 采信与否，weight 最终分量（只能不变或调低，不能调高）。
-- 不采信或调低时，reason 必须是这些代码之一：{_ADOPT_CODES}。
-- direction 必须和采信后的分差方向一致：采信的看多分量之和减去看空分量之和，大于 0 才能写偏多，小于 0 才能写偏空；差距不到 2 就写不明。
-- 必须回答事后复盘：假设 5 个交易日后这个判断错了，最可能的原因是什么（postmortem，要带 cites）。要写成能观察到的信号：哪件已有事实或哪个价位的变化，会证明你错了；不要写「市场变化」「情绪反转」这类看不见的原因。
+工作顺序固定（禁止先看五人结论再凑证据）：
+1) 证据过滤：每条 argument 是否有 facts/events 依据、是否过期、是否在 5–20 日有效、是否传闻/预测、是否已充分反应、是否与事实方向不一致。
+2) 证据去重：同一根本事实/事件被多条论据重复包装时，保留最直接的一条，其余降权或不采信（reason 用 duplicate）；不得因多位分析师同向就当成多份独立证据。
+3) 逐条裁决 arguments → verdicts：每条 ref 恰好一次；adopt；weight 只能≤原值，不采信则为 0；不采信或调低时 reason 必须是 {_ADOPT_CODES}；采信且不调低则 reason 留空。不得因迎合倾向或多数分析师同向而抬权。
+4) 定方向：只对 adopt=true 的论据计分；看多权之和 − 看空权之和；≥2 偏多，≤−2 偏空，|分差|<2 不明。direction 必须与分差一致，不得事后改方向。证据质量差应在步骤 1–3 降权/剔除，不得绕开分差。下列情况宁可写不明：两边势均力敌、完成维度过少、关键维度 unavailable/过期、主要依据是未验证预测或单项资金流、核心事实歧义大。「不明」是正常结论，不是失败。
+5) 处理 dimensions 冲突：多数维度同向而最终方向相反，或维度互斥时，须在 conflict_note 写清：谁不同意、依据什么、凭哪条事实/论据不跟他们；禁止简单表决或把把握度相加。unavailable / headline 为 null 的维度不作依据，也不写 notice。
+6) A 股短线原则：T+1 与涨跌停影响兑现；披露窗口、解禁/减持、板块阶段常比长期估值更重要；估值高低本身不定短线方向。资金流：大额净流出是常态，不能单独支撑方向；只有 flow.vs_self 显示相对自身明显偏离，且与价格或板块同向，才可作旁证；不得推断资金身份。已反应须有价格/成交/时间等事实支持，不能凭感觉。权重按证据性质（硬事件未反应、板块结构、新鲜财报变化优先；纯资金流与软新闻宜降），不按「谁开口」定档。
+7) 选 levels：有候选的方向必须各选一个 id；无候选则 null。优先 verified 且 consequence 明确、能改变方向或位置、匹配 5–20 日的关口。比较更近与更远：为什么选它、不选更近或更远的另一个；why 不得出现价格、不得抄 basis。未验证候选（consequence 空或 verified=false）仅当该方向无其他候选可选；why 只称观察位，不编造穿越后果。buffer 取 {_DOWN_BUFFERS}；下方 confirm 取 {_DOWN_CONFIRMS}；上方 confirm 取 {_UP_CONFIRMS}；meaning 取 {_UP_MEANINGS}。偏空时下方 buffer 只能 0%；选 priced_in 时 cites 须含「已反应」相关事实。参考：利好未反应可留空间但确认严；利空/退潮/已兑现不留空间；不明优先盯近处有效关口、不留缓冲、收盘确认（仍须服从候选与菜单）。
+8) notices：按 headlines 顺序每维最多一条；tag 只能是利好、风险、已反应、中性；cites 只能用该维 headline.facts；headline 为 null 不写。
+9) watch_ids：从 events 选 1–2 个（或空列表），优先 5–20 日内可验证、可能改方向且尚未充分反应的事件。
+10) postmortem：假设 5 个交易日后判断错了，最可能原因是什么；必须写成能观察到的信号（已有事实/事件结果/已选价位有效突破或跌破/资金或板块事实不再成立），带 cites；禁止「市场变化」「情绪反转」等空话。方向为不明时，也要写什么已有信号出现后需重估。
 
-要盯的两个价由你来选。代码已经用规则算出候选集 candidates，你不能新写一个价格，也不能在 why 里出现价格。
-每个候选有：id、dir（down 是现价下方，up 是上方）、name、dist（离现价多远）、sources（合并进来的同类价）、basis（这个价怎么算出来的）、consequence（穿过之后判断会怎样）、verified。
-有候选的方向必须各选一个：
-- levels.down.base、levels.up.base 只能填该方向候选的 id。这个方向没有候选时，那边写 null。
-- why 要说清楚为什么选它、不选更近或更远的另一个：它是什么关口，穿过之后这次的方向或位置会怎样变。不要把 basis 再抄一遍，也不要把下面这些原句抄进去。
-A 股里看支撑和压力的老话，用来决定选哪个价：
-- 均线是多空分界。20 日均线还在脚下，这轮上涨的人还认；收盘跌破，认的人就少了。板块还在主升时，下方优先盯均线。
-- 成本是真防守。大资金成本和均线挨在一起时，盯这一簇，不要再去选更远的低点。跌破成本，这轮进来的人整体就亏了。
-- 前高是套牢盘。上方先看前高，站上才算上面的压力去掉。一年高点更远，这几个星期到不了就不要选。
-- 支撑破了变压力，压力破了变支撑。现价已经在均线或成本下方时，它是上方的关口，不要再当成下方。
-- 缩量碰到不算，放量穿过才算。退潮、利空、利好已经反应，确认用收盘或连续两日；还有人跟着、利好尚未反应，确认用放量。
-- 高位先看近处的均线，不看一年低点。位置已经偏高时，远支撑对这几个星期没有用。
-- cites 填支撑这句 why 的事实编号或事件编号。
-- buffer、confirm、meaning 仍按下面的菜单选。综合方向为偏空时，下方 buffer 只能是 0%。
-- buffer 取 {" / ".join(f"{v:.0%}" for v in policy.DOWN_BUFFERS)}；下方 confirm 取 {" / ".join(policy.DOWN_CONFIRMS)}。上方 confirm 取 {" / ".join(policy.UP_CONFIRMS)}；meaning 取 {" / ".join(policy.UP_MEANINGS)}。选 priced_in 时 cites 里必须有「已反应」相关的事实。
-- 参考：利好扎实且未反应、资金流入 → 给空间、确认严；利空、板块退潮或利好已兑现 → 不给空间、越早提醒；方向不明 → 20 日均线、不留缓冲、收盘即可。
-- consequence 为空、verified 为 false 的候选没有通过后果验证。只有该方向没有别的候选时才会出现，选它时不要写穿过之后的后果。
-- watch_ids 从 events 里选 1–2 个编号，只给编号。
-
-headline 不超过 {policy.HEADLINE_MAX} 个字，不要带「偏多：」这类前缀，意思要和 direction 一致。
+headline 不超过 {policy.HEADLINE_MAX} 个字，不要带「偏多：」前缀，意思与 direction 一致。
 {_COMMON}
 输出：{{
  "direction": "偏多|偏空|不明", "position": "偏低|适中|偏高",
