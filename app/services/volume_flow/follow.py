@@ -134,10 +134,10 @@ def _big(metrics: dict, sign: int) -> dict:
 
 
 def _short_windows(metrics: dict) -> dict:
-    """主窗口外的对照：近 3 日看拐头，近 20 日看波段底色。"""
+    """多窗对照：3/5 看拐头，20 看波段，60 看中期底色。"""
     rows = {row.get("days"): row for row in metrics.get("windows") or []}
     parts = []
-    for days in (3, 20):
+    for days in (3, 5, 20, 60):
         row = rows.get(days)
         if not row:
             continue

@@ -87,11 +87,12 @@ class Data:
 
     def flow(self, ts_code: str) -> dict[str, int]:
         """个股大资金（东方财富 net_amount）连续流入、流出的天数，数到最近一天为止。"""
+        # 只数连续天数，20 日窗口够用；比默认 250 日冷启动快很多。
         try:
             from app.services.series import get_flow_daily
             from app.synthesis.watchlist import stock_of
 
-            items = get_flow_daily(stock_of({"ts_code": ts_code, "name": ts_code}), 30).get("items") or []
+            items = get_flow_daily(stock_of({"ts_code": ts_code, "name": ts_code}), 20).get("items") or []
         except Exception:
             return {"in": 0, "out": 0}
         values = [tape.num(row.get("net_amount")) for row in sorted(items, key=lambda row: str(row.get("trade_date")))]
@@ -229,14 +230,19 @@ class Data:
 
     def market_since(self) -> str:
         """现在这个大盘结论从哪天开始没变过（市场页每日快照）。没有快照就返回空。"""
+        hit = cache.get("holdings:market_since")
+        if hit is not None:
+            return hit
         try:
             from app.services import market_changes
             from app.services.market_store import get_store
 
             rows = market_changes.history(get_store().snapshots())
-            return rows[0]["since"] if rows else ""
+            out = rows[0]["since"] if rows else ""
         except Exception:
-            return ""
+            out = ""
+        cache.set("holdings:market_since", out, _ZONE_TTL)
+        return out
 
     # ------------------------------------------------------------ 股票
     def resolve(self, query: str) -> dict | None:

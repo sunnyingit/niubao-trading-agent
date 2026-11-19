@@ -113,8 +113,13 @@ MERGE_GAP = 3
 RECENT = 5                 # 托市或异动后 5 个交易日内显示「托市中 / 异动中」
 HINT_THEMES = ("半导体", "医药", "有色黄金", "软件科技")
 PEAK_DAYS = 10
-GONE_MILD = 0.10
-GONE_HARD = 0.30
+GONE_MILD = 0.10           # 基线不足时的回落档位兜底
+GONE_HARD = 0.30           # 基线不足时的确认线兜底；不再单独触发「可能在撤」
+GONE_MILD_N = 8.0          # 回落 ≥ N × 自身日变动中位 → 部分回落
+GONE_HARD_N = 20.0         # 回落 ≥ N × 自身日变动中位 → 确认线（辅助）
+POS_LOOKBACK = 60
+POS_HIGH = 0.70            # 近 60 日收盘分位 ≥ 此值算高位
+DRAIN_DAYS = 5             # 短期份额净减窗口
 SELL_WINDOW, SELL_MIN, SELL_GROUPS = 3, 2, 3
 TOP_N, TOP_BROAD, MIN_GROUPS = 3, 2, 2
 # 起步值还没回测。None 表示这一条先不挡，避免编一个金额。
@@ -341,6 +346,127 @@ def basket_windows(frames: dict, names: list[str], index: int, spans: tuple[int,
     return out
 
 
+def basket_mz_daily(
+    frames: dict,
+    names: list[str],
+    calendar: list[str],
+    broad_money: list[float | None],
+    hit_days: set[str] | None = None,
+    keep: int = 30,
+) -> list[dict]:
+    """宽基各组当日 1 日 Mz 的中位数；附带净申购（亿）与托市/异动日标记。"""
+    hits = hit_days or set()
+    out = []
+    for index in range(BASELINE, len(calendar)):
+        scores = []
+        for name in names:
+            _cum, mz, ok = _score(frames[name]["rate"], index, 1)
+            if ok and mz is not None:
+                scores.append(mz)
+        if not scores:
+            continue
+        day = calendar[index]
+        row = {"date": tape.iso(day), "mz": round(tape._median(scores), 2)}
+        money = broad_money[index] if index < len(broad_money) else None
+        if money is not None:
+            row["net"] = round(float(money), 2)
+            row["net_label"] = "宽基净申购"
+        if day in hits:
+            row["action"] = True
+        out.append(row)
+    return out[-keep:]
+
+
+def _hold_anchor(series: list, start: int, side: str, hard: float = GONE_HARD) -> tuple[float, float, float, int] | None:
+    """托市后 10 日高点（或卖出后低点）、警戒线、极值日下标。回落只从极值日之后计。"""
+    if start < 1 or start >= len(series):
+        return None
+    before = series[start - 1]
+    raw = list(enumerate(series[start:start + PEAK_DAYS]))
+    window = [(i, v) for i, v in raw if v is not None]
+    if before is None or not window:
+        return None
+    if side == "sell":
+        offset, trough = min(window, key=lambda item: item[1])
+        if before <= trough:
+            return None
+        line = trough + hard * (before - trough)
+        return before, trough, line, start + offset
+    offset, peak = max(window, key=lambda item: item[1])
+    if peak <= before:
+        return None
+    line = peak - hard * (peak - before)
+    return before, peak, line, start + offset
+
+
+def hold_gone_daily(
+    frames: dict,
+    names: list[str],
+    calendar: list[str],
+    start: int,
+    side: str = "buy",
+    keep: int = 30,
+    mild: float = GONE_MILD,
+    hard: float = GONE_HARD,
+) -> list[dict]:
+    """与「钱还在」同口径：相对托市后高点的累计回落%。
+
+    柱高用 mz = −回落 / mild：0≈还在，−1≈刚过部分回落线，−hard/mild≈确认线。
+    高点尚未出现的日子记 0，避免「还在堆量」被画成大幅回落。
+    """
+    if not names or start < 1:
+        return []
+    anchors: list[tuple[list, float, float, float, int]] = []
+    for name in names:
+        series = (frames.get(name) or {}).get("level") or []
+        hit = _hold_anchor(series, start, side, hard)
+        if hit:
+            anchors.append((series, hit[0], hit[1], hit[2], hit[3]))
+    if not anchors:
+        return []
+    # 中位组的极值日之后才开始画，和判定用的那一组对齐
+    peak_days = sorted(a[4] for a in anchors)
+    pivot = peak_days[len(peak_days) // 2]
+    out = []
+    begin = max(pivot, len(calendar) - keep)
+    scale = mild if mild > 0 else GONE_MILD
+    for index in range(begin, len(calendar)):
+        ratios, nows, gaps = [], [], []
+        for series, before, extreme, line, extreme_at in anchors:
+            if index >= len(series) or series[index] is None:
+                continue
+            now = series[index]
+            if index < extreme_at:
+                ratio = 0.0
+            elif side == "sell":
+                if before <= extreme:
+                    continue
+                ratio = max(0.0, (now - extreme) / (before - extreme))
+            else:
+                if extreme <= before:
+                    continue
+                ratio = max(0.0, (extreme - now) / (extreme - before))
+            if side == "sell":
+                gaps.append((line - now) / 1e4)
+            else:
+                gaps.append((now - line) / 1e4)
+            ratios.append(ratio)
+            nows.append(now / 1e4)
+        if not ratios:
+            continue
+        order = sorted(range(len(ratios)), key=lambda i: ratios[i])
+        mid = order[len(order) // 2]
+        gone = ratios[mid]
+        out.append({
+            "date": tape.iso(calendar[index]),
+            "mz": round(-gone / scale, 2),
+            "gone": round(gone * 100, 1),
+            "level": round(nows[mid], 2),
+            "gap": round(gaps[mid], 2),
+        })
+    return out[-keep:]
+
+
 def _multiple(turnover: list, index: int):
     today = turnover[index] if 0 <= index < len(turnover) else None
     prior = [item for item in turnover[:index] if item][-BASELINE:]
@@ -379,7 +505,7 @@ def _events(hits: list[dict]) -> list[dict]:
     return found
 
 
-def giveback(levels: dict[str, list], names: list[str], start: int, side: str = "buy") -> dict | None:
+def giveback(levels: dict[str, list], names: list[str], start: int, side: str = "buy", hard: float = GONE_HARD) -> dict | None:
     """买入看从高点回吐了多少，卖出看从低点回补了多少。各组取中位数。窗口是之后 10 个交易日。"""
     ratios, lines = [], []
     for name in names:
@@ -396,14 +522,14 @@ def giveback(levels: dict[str, list], names: list[str], start: int, side: str = 
             if before <= trough:
                 continue
             ratio = (now - trough) / (before - trough)
-            line = trough + GONE_HARD * (before - trough)
+            line = trough + hard * (before - trough)
             lines.append((line / 1e4, now / 1e4, (line - now) / 1e4))
         else:
             peak = max(window)
             if peak <= before:
                 continue
             ratio = (peak - now) / (peak - before)
-            line = peak - GONE_HARD * (peak - before)
+            line = peak - hard * (peak - before)
             lines.append((line / 1e4, now / 1e4, (now - line) / 1e4))
         ratios.append(ratio)
     if not ratios:
@@ -413,8 +539,81 @@ def giveback(levels: dict[str, list], names: list[str], start: int, side: str = 
     return {"gone": max(0.0, ratios[mid]), "line_yi": lines[mid][0], "now_yi": lines[mid][1], "gap_yi": lines[mid][2], "side": side}
 
 
-def label_of(kind: str | None, since: int | None, gone: float | None, withdrawing: bool, stated: bool, side: str = "buy") -> str:
-    """5 天内是托市中或异动中。之后买入看回吐，卖出看回补。都不进总档。"""
+def _median_abs_rate(rates: list, end_i: int) -> float | None:
+    prior = [abs(item) for item in rates[:end_i + 1] if item is not None][-BASELINE:]
+    if len(prior) < BASELINE // 2:
+        return None
+    return tape._median(prior)
+
+
+def hold_bands(frames: dict, names: list[str], start: int, end_i: int, side: str = "buy") -> dict:
+    """钱还在 / 部分回落 / 确认线：按各组自身日变动尺度定，不再死用 10%/30%。"""
+    milds, hards = [], []
+    for name in names:
+        series = (frames.get(name) or {}).get("level") or []
+        rates = (frames.get(name) or {}).get("rate") or []
+        scale = _median_abs_rate(rates, end_i)
+        hit = _hold_anchor(series, start, side)
+        if scale is None or not hit:
+            continue
+        before, extreme, _line, _at = hit
+        span = abs(extreme - before)
+        if before <= 0 or span <= 0:
+            continue
+        # N × 日变动中位 换算成「相对出手增量」的比例
+        milds.append(GONE_MILD_N * scale * before / span)
+        hards.append(GONE_HARD_N * scale * before / span)
+    if not milds:
+        return {"mild": GONE_MILD, "hard": GONE_HARD, "relative": False}
+    mild = sorted(milds)[len(milds) // 2]
+    hard = sorted(hards)[len(hards) // 2]
+    mild = min(max(mild, 0.03), 0.25)
+    hard = min(max(hard, mild + 0.05), 0.60)
+    return {"mild": mild, "hard": hard, "relative": True}
+
+
+def index_pctile(calendar: list[str], index_close: dict[str, float], pct: dict[str, float], end_i: int,
+                 lookback: int = POS_LOOKBACK) -> float | None:
+    """近 lookback 日收盘分位。缺收盘价时用涨跌幅从 100 往前推。"""
+    closes = []
+    for i in range(max(0, end_i - lookback + 1), end_i + 1):
+        value = index_close.get(calendar[i])
+        if value is not None:
+            closes.append(value)
+    if len(closes) < lookback // 2:
+        if not pct:
+            return None
+        level, series = 100.0, []
+        for day in calendar[:end_i + 1]:
+            move = pct.get(day)
+            if move is not None:
+                level *= 1 + move / 100
+            series.append(level)
+        closes = series[-lookback:]
+        if len(closes) < lookback // 2:
+            return None
+    cur = closes[-1]
+    return sum(1 for item in closes if item <= cur) / len(closes)
+
+
+def short_share_drain(frames: dict, names: list[str], end_i: int) -> dict:
+    """近 DRAIN_DAYS 日份额累计净减是否显著：对照该组自身基线的 Mz，至少 MIN_GROUPS 组达标。"""
+    hits, rows = [], []
+    for name in names:
+        cum, mz, ok = _score(frames[name]["rate"], end_i, DRAIN_DAYS)
+        hit = bool(ok and mz is not None and cum is not None and mz < -MZ_ON and abs(cum) >= ABS_FLOOR)
+        if hit:
+            hits.append(name)
+        rows.append({"name": name, "cum5": cum, "mz5": mz, "hit": hit, "short": not ok})
+    return {"hit": len(hits) >= MIN_GROUPS, "groups": hits, "rows": rows}
+
+
+def label_of(kind: str | None, since: int | None, gone: float | None, withdrawing: bool, stated: bool,
+             side: str = "buy", mild: float = GONE_MILD, hard: float = GONE_HARD) -> str:
+    """5 天内是托市中或异动中。之后买入看回吐，卖出看回补。都不进总档。
+
+    「可能在撤」只由 withdrawing（高位+短减或迹象二）触发；累计回落再大也只到「部分回落」。
+    """
     if kind == "托市" and since is not None and since < RECENT:
         return "托市中"
     if kind == "异动" and since is not None and since < RECENT:
@@ -423,15 +622,13 @@ def label_of(kind: str | None, since: int | None, gone: float | None, withdrawin
         if withdrawing:
             return "可能在撤"
         if since is not None:
-            if gone is None or gone < GONE_MILD:
+            if gone is None or gone < mild:
                 return "钱还在"
-            if gone <= GONE_HARD:
-                return "部分回落"
-            return "可能在撤"
+            return "部分回落"
     if kind == "异动" and side == "sell" and since is not None:
-        if gone is None or gone < GONE_MILD:
+        if gone is None or gone < mild:
             return "还没回补"
-        if gone <= GONE_HARD:
+        if gone <= hard:
             return "部分回补"
         return "明显回补"
     if stated:
@@ -444,24 +641,59 @@ def strength_of(signal: float, since: int) -> float:
     return signal * max(0.0, 1 - since / RECENT)
 
 
+def _redeem_day(calendar, frames, broad_names, pct, index: int) -> dict | None:
+    """单日：上证未大跌，且至少 3 组宽基明显赎回，才记一笔赎回日。"""
+    move = pct.get(calendar[index])
+    if move is None or move <= DROP_HARD:
+        return None
+    names = [name for name in broad_names if group_hit(frames[name]["rate"], index, "down")["hit"]]
+    total = sum(frames[name]["money"][index] or 0 for name in names)
+    if len(names) < SELL_GROUPS:
+        return None
+    if REDEEM_MIN_YI is not None and total > -REDEEM_MIN_YI:
+        return None
+    return {"day": calendar[index], "pos": index, "groups": names, "delta": total, "index_pct": move}
+
+
 def _sell_days(calendar, frames, broad_names, pct) -> list[dict]:
-    """不跌过 1% 的日子里，至少 3 组宽基大额赎回。近 3 天里凑满 2 天才算迹象二。"""
-    hits = {}
+    """近 3 天里凑满 2 个赎回日，才算迹象二。"""
     last = len(calendar) - 1
+    hits = {}
     for index in range(max(0, last - SELL_WINDOW + 1), last + 1):
-        move = pct.get(calendar[index])
-        if move is None or move <= DROP_HARD:
-            continue
-        names = [name for name in broad_names if group_hit(frames[name]["rate"], index, "down")["hit"]]
-        total = sum(frames[name]["money"][index] or 0 for name in names)
-        if len(names) < SELL_GROUPS:
-            continue
-        if REDEEM_MIN_YI is not None and total > -REDEEM_MIN_YI:
-            continue
-        hits[index] = {"day": calendar[index], "pos": index, "groups": names, "delta": total, "index_pct": move}
+        row = _redeem_day(calendar, frames, broad_names, pct, index)
+        if row:
+            hits[index] = row
     if sum(1 for index in range(last - SELL_WINDOW + 1, last + 1) if index in hits) < SELL_MIN:
         return []
     return [hits[index] for index in sorted(hits)]
+
+
+def redeem_pulse(calendar, frames, broad_names, pct) -> dict:
+    """主卡「有没有在撤」的每日口径：近 3 日赎回日数、当日赎回组数与金额。"""
+    last = len(calendar) - 1
+    window = []
+    for index in range(max(0, last - SELL_WINDOW + 1), last + 1):
+        move = pct.get(calendar[index])
+        names = [name for name in broad_names if group_hit(frames[name]["rate"], index, "down")["hit"]]
+        total = sum(frames[name]["money"][index] or 0 for name in names)
+        hit = _redeem_day(calendar, frames, broad_names, pct, index) is not None
+        window.append({
+            "date": tape.iso(calendar[index]),
+            "groups": len(names),
+            "delta": round(total, 2),
+            "index_pct": move,
+            "hit": hit,
+            "skipped": move is not None and move <= DROP_HARD,
+        })
+    today = window[-1] if window else None
+    return {
+        "window": window,
+        "hit_days": sum(1 for row in window if row["hit"]),
+        "need_days": SELL_MIN,
+        "today_groups": None if not today else today["groups"],
+        "today_delta": None if not today else today["delta"],
+        "today_skipped": bool(today and today["skipped"]),
+    }
 
 
 def history(actions: list[dict], index_days: list[str], pct: dict[str, float]) -> list[dict]:
@@ -563,14 +795,35 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
         last = support[-1] if support else max(latest, key=lambda item: (len(item["groups"]), abs(item["delta"] or 0)))
     since = None if not last else last_i - last["pos"]
     side = "buy" if not last else last["side"]
-    held = None if not last else giveback({name: frames[name]["level"] for name in frames}, sorted(last["groups"]), last["pos"], side)
+    hold_names = sorted(last["groups"]) if last else []
+    bands = (
+        hold_bands(frames, hold_names, last["pos"], last_i, side)
+        if last and hold_names else {"mild": GONE_MILD, "hard": GONE_HARD, "relative": False}
+    )
+    held = None if not last else giveback(
+        {name: frames[name]["level"] for name in frames}, hold_names, last["pos"], side, bands["hard"],
+    )
     gone = None if not held else held["gone"]
     sells = _sell_days(calendar, frames, broad_names, pct)
+    out_pulse = redeem_pulse(calendar, frames, broad_names, pct)
     sign2 = bool(sells)
-    sign1 = side != "sell" and gone is not None and gone > GONE_HARD and since is not None and since >= RECENT
+    pos = index_pctile(calendar, index_close, pct, last_i)
+    drain = short_share_drain(frames, broad_names, last_i)
+    # 主信号：高位 + 近 5 日份额显著净减（自身尺度）。累计回落只作确认，不单独触发。
+    sign1 = (
+        side != "sell"
+        and since is not None and since >= RECENT
+        and pos is not None and pos >= POS_HIGH
+        and drain["hit"]
+    )
+    confirm_gone = (
+        side != "sell"
+        and gone is not None and gone > bands["hard"]
+        and since is not None and since >= RECENT
+    )
     withdrawing = sign1 or (sign2 and side != "sell")
     kind = None if not last else last["state"]
-    label = label_of(kind, since, gone, withdrawing, False, side)
+    label = label_of(kind, since, gone, withdrawing, False, side, bands["mild"], bands["hard"])
     signal = {"托市": "疑似托市", "异动": "疑似异动"}.get(kind or "", "")
     # 按这一波结束日算「最近有几次」：长波拖到近几天才结束，也应算进 1/3/5 日，不能只看起点。
     counts = {n: sum(1 for item in events if last_i - item["end"] < n) for n in (1, 3, 5, 30, 60)}
@@ -595,8 +848,6 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
         if row["hit"]:
             industry.append(name)
     marks = []
-    if index_last > share_last:
-        marks.append("待更新")
     if pressures[last_i]["near"] and not pressures[last_i]["on"]:
         marks.append("接近承压")
     if last and last["split"]:
@@ -611,15 +862,12 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
         marks.append("行业提示：" + "、".join(industry))
     if last and last["short"] and label in ("托市中", "异动中"):
         marks.append("基线不足")
+    if sign1 and confirm_gone:
+        marks.append("托市后份额回落作确认")
+    elif confirm_gone and not sign1:
+        marks.append("托市后份额回落较多，尚未满足高位短减")
     if sign1 and sign2:
         marks.append("迹象较强")
-    if last and last.get("multiple") and last["multiple"] >= 3:
-        turn_day = last.get("multiple_day") or last["day"]
-        turn_group = last.get("multiple_group") or "宽基"
-        # 当天所有达标宽基组都会比；这里只写出放大最多的那一组。
-        marks.append(
-            f"达标组里最热是 {turn_group}：{tape.iso(turn_day)[5:]} 成交为近 {BASELINE} 天中位水平的 {last['multiple']:.0f} 倍"
-        )
     found = None
     if last and last["pos"] + 1 < len(calendar):
         found = calendar[last["pos"] + 1]
@@ -640,6 +888,11 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
             "found": tape.iso(found) if item is last and found else "",
         }
     today_flow = money_went_broad({name: frames[name]["money"][last_i] for name in frames}, set(broad_names))
+    mz_daily = basket_mz_daily(frames, broad_names, calendar, broad_money, hit_days, 30)
+    hold_bars = (
+        hold_gone_daily(frames, hold_names, calendar, last["pos"], side, 30, bands["mild"], bands["hard"])
+        if last and hold_names else []
+    )
     return {
         "ok": True, "label": label, "confirm": None, "signal": signal,
         "confirm_word": signal,
@@ -647,13 +900,21 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
         "latest": tape.iso(share_last), "stale": index_last > share_last,
         "strength": 0.0 if since is None or label not in ("托市中", "异动中") else strength_of(max((day.get("multiple") or 1) for day in last["days"]), since),
         "last": None if not last else pack(last),
-        "hold": None if not held else {**held, "since": tape.iso(last["day"]), "days": since},
+        "hold": None if not held else {
+            **held, "since": tape.iso(last["day"]), "days": since,
+            "mild": bands["mild"], "hard": bands["hard"], "relative": bands["relative"],
+        },
         "sell": None if not (sign1 or sign2) else {
-            "sign1": sign1, "sign2": sign2, "groups": sells[-1]["groups"] if sells else sorted(last["groups"]) if last else [],
+            "sign1": sign1, "sign2": sign2, "confirm_gone": confirm_gone,
+            "pos_pctile": None if pos is None else round(pos, 3),
+            "drain_groups": drain["groups"],
+            "groups": sells[-1]["groups"] if sells else (drain["groups"] or hold_names),
             "delta": sells[-1]["delta"] if sells else None, "index_pct": sells[-1]["index_pct"] if sells else None,
             "days": len(sells), "day": tape.iso(sells[-1]["day"]) if sells else "",
         },
+        "out_pulse": out_pulse,
         "marks": marks, "counts": counts, "series": series,
+        "mz_daily": mz_daily, "hold_mz_daily": hold_bars,
         "actions": [pack(item) for item in events[-6:]],
         "history": history([
             {
@@ -671,11 +932,12 @@ def summarize(shares: dict[str, list[dict]], closes: dict[str, list[dict]], pct:
 
 def build(today: date) -> dict:
     start = tape._ymd_offset(today, 400)
+    end = tape._ymd(today)
     codes = [code for code, _name in _flat(BROAD + INDUSTRY + CROSS)]
     shares = dict(zip(codes, tape._parallel(codes, lambda code: tape.fund_share_rows(code, today))))
     closes = dict(zip(codes, tape._parallel(codes, lambda code: tape.fund_bar_rows(code, today))))
-    idx = tape.cached(f"indexpx:{start}", lambda: tape.pro().index_daily(
-        ts_code="000001.SH", start_date=start, end_date=tape._ymd(today), fields="trade_date,pct_chg,close",
+    idx = tape._cached_through(f"indexpx:{start}:{end}", end, lambda: tape.pro().index_daily(
+        ts_code="000001.SH", start_date=start, end_date=end, fields="trade_date,pct_chg,close",
     ))
     pct, index_close = {}, {}
     for row in idx:

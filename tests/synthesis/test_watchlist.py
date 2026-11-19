@@ -101,6 +101,14 @@ class QuotesTest(unittest.TestCase):
         self.assertEqual([row["name"] for row in found("茅台")], ["贵州茅台"])
         self.assertEqual(found("腾讯")[0]["industry"], None)
 
+    def test_search_prefers_a_share_over_hk_alias(self):
+        listed = [{"ts_code": "002050.SZ", "symbol": "002050", "name": "三花智控", "industry": "家电零件"}]
+        hk = [{"ts_code": "02050.HK", "symbol": "02050", "name": "三花智控", "fullname": "三花智控股份有限公司", "industry": None}]
+        rows = quotes.search("三花智控", listed=lambda: listed, hk_listed=lambda: hk)
+        self.assertEqual([row["ts_code"] for row in rows], ["002050.SZ", "02050.HK"])
+        rows = quotes.search("02050.HK", listed=lambda: listed, hk_listed=lambda: hk)
+        self.assertEqual(rows[0]["ts_code"], "02050.HK")
+
 
 class StoreTest(unittest.TestCase):
     def test_watchlist_and_alerts(self):

@@ -4,8 +4,7 @@ import os
 from pathlib import Path
 
 
-def _load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
+def _apply_env_file(env_path: Path) -> None:
     if not env_path.exists():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -14,6 +13,16 @@ def _load_env_file() -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _load_env_file() -> None:
+    # 仓库旁路 .env；打包客户端写到 STOCK_DATA_DIR/.env，不进安装包。
+    roots = [Path(__file__).resolve().parents[1]]
+    data = (os.environ.get("STOCK_DATA_DIR") or "").strip()
+    if data:
+        roots.append(Path(data))
+    for root in roots:
+        _apply_env_file(root / ".env")
 
 
 _load_env_file()

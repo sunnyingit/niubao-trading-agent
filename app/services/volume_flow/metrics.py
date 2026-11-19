@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 _SIZES = ("super_large", "large", "medium", "small")
-# 相对强弱多窗口：短 / 一周交易日 / 主窗口常用档；和 windows.rows 里的 3、5、20 对齐
-REL_WINDOWS = (3, 5, 20)
+# 相对强弱多窗口：短 / 一周 / 波段 / 中期；和 windows.rows 里的 3、5、20、60 对齐
+REL_WINDOWS = (3, 5, 20, 60)
 # 量价图展示窗口：主结论可以是 5 日，图仍看近 20 日更清楚
 CHART_WINDOW = 20
 

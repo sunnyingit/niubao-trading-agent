@@ -132,6 +132,20 @@ def modified_z(value: float | None, center: float | None, mad: float | None) -> 
     return MZ_K * (value - center) / mad
 
 
+def _mz_daily_series(values: list[float], dates: list[str], keep: int = 30) -> list[dict]:
+    """逐日 1 日 Mz：当天值对照此前近 60 日中位数/MAD。正偏高、负偏低。"""
+    if len(values) != len(dates) or len(values) <= BASELINE_DAYS:
+        return []
+    out = []
+    for i in range(BASELINE_DAYS, len(values)):
+        med, mad, enough = _baseline(values[:i])
+        z = modified_z(values[i], med, mad) if enough else None
+        if z is None:
+            continue
+        out.append({"date": dates[i], "mz": round(float(z), 2)})
+    return out[-keep:]
+
+
 def _window(windows: dict, n: int):
     if not isinstance(windows, dict):
         return None
@@ -367,6 +381,28 @@ def _margin_rates(days: list[str], by_day: dict) -> tuple[list[float], list[floa
     return rates, nets
 
 
+def _margin_mz_daily(days: list[str], by_day: dict, keep: int = 30) -> list[dict]:
+    """余额日变化率的逐日 1 日 Mz；附带当日净买入（亿）方便对照，二者口径不同。"""
+    rate_dates, rates, nets = [], [], []
+    for prev, day in zip(days, days[1:]):
+        if _day_gap(prev, day) > 4:
+            continue
+        base = by_day[prev]["rzye"]
+        if not base:
+            continue
+        rate_dates.append(_iso(day))
+        rates.append(by_day[day]["rzye"] / base - 1)
+        nets.append((by_day[day]["rzmre"] - by_day[day]["rzche"]) / 1e8)
+    points = _mz_daily_series(rates, rate_dates, keep)
+    net_of = dict(zip(rate_dates, nets))
+    for row in points:
+        net = net_of.get(row["date"])
+        if net is not None:
+            row["net"] = round(float(net), 2)
+            row["net_label"] = "融资净买入"
+    return points
+
+
 def _judge_margin_book(days: list[str], by_day: dict) -> tuple[str, list[int], str, list[str]]:
     rates, nets = _margin_rates(days, by_day)
     got = {}
@@ -400,12 +436,24 @@ def format_turnover(rows: list[dict], index_pct: dict[str, float] | None = None,
     if len(rows) < 6:
         return _body([], "没有取到足够的全市场成交额")
     latest = rows[-1]
-    amounts = [_num(row.get("amount")) for row in rows]
-    amounts = [item for item in amounts if item and item > 0]
-    logs = [math.log(item) for item in amounts]
+    paired = [
+        (_iso(row.get("trade_date")), math.log(amount), amount)
+        for row in rows
+        if (amount := _num(row.get("amount"))) and amount > 0
+    ]
+    dates_log = [item[0] for item in paired]
+    logs = [item[1] for item in paired]
+    amounts = [item[2] for item in paired]
     avg60 = _mean(rows[-60:], "amount")
     windows = {n: None if not avg60 else _mean(rows[-n:], "amount") / avg60 - 1 for n in SPANS}
     sides, scores, baseline_short = _turnover_sides(logs)
+    mz_daily = _mz_daily_series(logs, dates_log, 30)
+    # amount 与卡片一致，单位已是亿元
+    amt_of = {d: a for d, a in zip(dates_log, amounts)}
+    for row in mz_daily:
+        amt = amt_of.get(row["date"])
+        if amt is not None:
+            row["amount"] = round(float(amt), 2)
     label = judge_turnover_votes(sides, (sides.get(1, "没有"), _prior_day_side(logs)))
     votes = [n for n in (1, 3, 5, 30) if sides.get(n) == label and label in ("冷清", "活跃")]
     ratio5 = windows[5]
@@ -432,6 +480,7 @@ def format_turnover(rows: list[dict], index_pct: dict[str, float] | None = None,
         "avg60": avg60,
         "windows": windows,
         "mz": scores,
+        "mz_daily": mz_daily,
         "pctile": pctile,
         "label": label,
         "votes": votes,
@@ -551,11 +600,20 @@ def _etf_series(shares: dict[str, list[dict]]) -> dict:
         series.append({"date": _iso(day), "value": total, "delta": delta})
     windows = {n: _growth(totals[-1], totals[-1 - n]) if len(totals) > n else None for n in SPANS}
     last_gap = _day_gap(days[-2], days[-1])
+    # 日变化相对自身常态的 1 日 Mz（和判定用的份额变化方向一致）
+    day_dates = [_iso(day) for day in days]
+    mz_daily = _mz_daily_series(day_changes, day_dates, 30)
+    delta_of = dict(zip(day_dates, day_changes))
+    for row in mz_daily:
+        delta = delta_of.get(row["date"])
+        if delta is not None:
+            row["delta"] = round(float(delta), 2)
     return {
         "series": series[-60:],
         "total": totals[-1],
         "day_change": None if last_gap > 4 else day_changes[-1],
         "windows": windows,
+        "mz_daily": mz_daily,
         "pctile": _pctile(totals[-240:], totals[-1]),
         "latest_date": _iso(days[-1]),
         "items": [_etf_item(code, shares.get(code) or []) for code in codes],
@@ -622,6 +680,8 @@ def format_margin(rows: list[dict], turnover: float | None = None) -> dict:
         "net": net / 1e8,
         "share": share,
         "pctile": _pctile([by_day[day]["rzye"] for day in days[-240:]], latest["rzye"]),
+        # 与判定同源：融资余额日变化率的 1 日 Mz（不是余额水平，也不是当日净买入）
+        "mz_daily": _margin_mz_daily(days, by_day),
         "series": [
             {"date": _iso(day), "value": by_day[day]["rzye"] / 1e8,
              "delta": (by_day[day]["rzmre"] - by_day[day]["rzche"]) / 1e8}
@@ -838,6 +898,7 @@ def monthly_funds(rows: list[dict], today: date) -> list[dict]:
 def format_breadth(today_rows: list[dict], history: dict[str, list[float]]) -> dict:
     up = down = flat = 0
     highs = lows = 0
+    above20 = above60 = known20 = known60 = 0
     for row in today_rows:
         pct = _num(row.get("pct_chg"))
         if pct is None:
@@ -851,16 +912,36 @@ def format_breadth(today_rows: list[dict], history: dict[str, list[float]]) -> d
         code = str(row.get("ts_code") or "")
         close = _num(row.get("close"))
         past = history.get(code) or []
-        if close is None or len(past) < 20:
+        if close is None:
             continue
-        if close >= max(past):
-            highs += 1
-        if close <= min(past):
-            lows += 1
+        if len(past) >= 20:
+            known20 += 1
+            window20 = past[-20:]
+            if close >= max(window20):
+                highs += 1
+            if close <= min(window20):
+                lows += 1
+            if close >= sum(window20) / 20:
+                above20 += 1
+        if len(past) >= 60:
+            known60 += 1
+            window60 = past[-60:]
+            if close >= sum(window60) / 60:
+                above60 += 1
     if not (up or down):
         return _body([], "没有取到涨跌家数")
     text = f"上涨 {up} 家，下跌 {down} 家，平盘 {flat} 家。近 25 个交易日新高 {highs} 家，新低 {lows} 家。"
-    return _body([{"id": "mkt.breadth", "text": text}], text, {"up": up, "down": down, "flat": flat, "highs": highs, "lows": lows})
+    if known20:
+        text += f"全 A 约 {round(above20 / known20 * 100)}% 站上 20 日线"
+        if known60:
+            text += f"、约 {round(above60 / known60 * 100)}% 站上 60 日线"
+        text += "。"
+    return _body([{"id": "mkt.breadth", "text": text}], text, {
+        "up": up, "down": down, "flat": flat, "highs": highs, "lows": lows,
+        "above_ma20": above20, "ma20_n": known20, "above_ma60": above60, "ma60_n": known60,
+        "above_ma20_share": (above20 / known20) if known20 else None,
+        "above_ma60_share": (above60 / known60) if known60 else None,
+    })
 
 
 def board_limit(ts_code: str) -> int | None:
@@ -1116,11 +1197,13 @@ def _pulse(today: date) -> dict:
 
 def _turnover(today: date) -> dict:
     start = _ymd_offset(today, 400)
+    end = _ymd(today)
     rows = []
     index_pct = {}
     for market in ("SH_MARKET", "SZ_MARKET"):
-        frame = _cached(f"turnover:{market}:{start}", lambda m=market: _pro().daily_info(
-            ts_code=m, start_date=start, end_date=_ymd(today), fields="trade_date,amount",
+        # 键带 end：同一自然日里盘后补齐今日行时，旧缓存能被 _cached_through 丢掉重取
+        frame = _cached_through(f"turnover:{market}:{start}:{end}", end, lambda m=market: _pro().daily_info(
+            ts_code=m, start_date=start, end_date=end, fields="trade_date,amount",
         ))
         for row in frame:
             rows.append(row)
@@ -1134,9 +1217,9 @@ def _turnover(today: date) -> dict:
     merged = [{"trade_date": day, "amount": amount} for day, amount in totals.items()]
     if merged:
         latest = max(merged, key=lambda row: row["trade_date"])
-        cache.set(f"market_tape:turnover:total:{_ymd(today)}", {"latest": latest["amount"]}, _TTL)
-    idx = _cached(f"indexpx:{start}", lambda: _pro().index_daily(
-        ts_code="000001.SH", start_date=start, end_date=_ymd(today), fields="trade_date,pct_chg,close",
+        cache.set(f"market_tape:turnover:total:{end}", {"latest": latest["amount"]}, _TTL)
+    idx = _cached_through(f"indexpx:{start}:{end}", end, lambda: _pro().index_daily(
+        ts_code="000001.SH", start_date=start, end_date=end, fields="trade_date,pct_chg,close",
     ))
     index_close = {}
     for row in idx:
@@ -1147,6 +1230,25 @@ def _turnover(today: date) -> dict:
             index_close[day] = _num(row.get("close"))
     body = format_turnover(merged, index_pct, index_close)
     return _from("turnover", body)
+
+
+def invalidate_today_series(today: date | None = None) -> None:
+    """盘后重算前丢掉滚到今天的成交/指数/份额/ETF 日线缓存（含旧版不带 end 的键）。"""
+    day = today or datetime.now(_ZONE).date()
+    start = _ymd_offset(day, 400)
+    end = _ymd(day)
+    for market in ("SH_MARKET", "SZ_MARKET"):
+        cache.delete(f"market_tape:turnover:{market}:{start}:{end}")
+        cache.delete(f"market_tape:turnover:{market}:{start}")
+    cache.delete(f"market_tape:indexpx:{start}:{end}")
+    cache.delete(f"market_tape:indexpx:{start}")
+    cache.delete(f"market_tape:turnover:total:{end}")
+    cache.delete(f"market_tape:turnover:total:{_ymd(day)}")
+    cache.delete(f"market_tape:holdidx:{start}:{end}")
+    cache.delete(f"market_tape:holdidx:{start}")
+    # 国家队 / 板块共用的 ETF 份额与日线：按前缀清，避免漏票
+    cache.delete_prefix("market_tape:fdshare:")
+    cache.delete_prefix("market_tape:fdbar:")
 
 
 def _etf(today: date) -> dict:
@@ -1275,6 +1377,26 @@ def _daily_rows(day: str) -> list[dict]:
     return _cached(f"daily:{day}", lambda d=day: _pro().daily(trade_date=d, fields="ts_code,close,pct_chg"))
 
 
+def advance_decline_series(today: date, n: int = 30) -> list[dict]:
+    """近 n 个交易日每天上涨 / 下跌家数（全 A 日线 pct_chg）。"""
+    days = _open_dates(today, n)
+    loaded = _parallel(days, _daily_rows)
+    out = []
+    for day, rows in zip(days, loaded):
+        up = down = 0
+        for row in rows or []:
+            pct = _num(row.get("pct_chg"))
+            if pct is None:
+                continue
+            if pct > 0:
+                up += 1
+            elif pct < 0:
+                down += 1
+        if up or down:
+            out.append({"date": _iso(day), "up": up, "down": down})
+    return out
+
+
 def _breadth(today: date) -> dict:
     days = _data_days(today)
     day = days[0]
@@ -1284,7 +1406,8 @@ def _breadth(today: date) -> dict:
         if today_rows:
             break
     history: dict[str, list[float]] = {}
-    dates = [item for item in _open_dates(today, 26) if item < day][-24:]
+    # 60 日均线占比需要更长收盘序列；日线按日缓存，冷启动会稍慢一次。
+    dates = [item for item in _open_dates(today, 65) if item < day][-60:]
     for rows in _parallel(dates, _daily_rows):
         for row in rows:
             close = _num(row.get("close"))
@@ -1294,6 +1417,7 @@ def _breadth(today: date) -> dict:
             history.setdefault(code, []).append(close)
     body = format_breadth(today_rows, history)
     body["metrics"]["date"] = _iso(day)
+    body["metrics"]["series"] = advance_decline_series(today, 30)
     return _from("breadth", body)
 
 
@@ -1483,7 +1607,41 @@ def _memory_ttl(name: str) -> float:
         return 24 * 3600
     if name.startswith("discl:"):
         return _TTL
+    # 滚到「今天」的序列盘后还会补行，短一点，避免上午的昨日截止缓存挂到晚上
+    rolling = ("turnover:", "indexpx:", "fdshare:", "fdbar:", "holdidx:")
+    if tail == today and name.startswith(rolling):
+        return 10 * 60
     return 7 * 24 * 3600
+
+
+def _latest_trade_ymd(rows: list[dict]) -> str:
+    days = [_ymd(row.get("trade_date")) for row in rows or []]
+    days = [day for day in days if len(day) >= 8]
+    return max(days) if days else ""
+
+
+def _need_today_bar(end: str) -> bool:
+    """收盘后才强求序列里有 end 这一天；盘中用到昨日收盘是正常的。"""
+    now = datetime.now(_ZONE)
+    today = now.strftime("%Y%m%d")
+    if end < today:
+        return True
+    if end > today:
+        return False
+    if now.weekday() >= 5:
+        return False
+    return now.hour > 15 or (now.hour == 15 and now.minute >= 5)
+
+
+def _cached_through(name: str, end: str, fetch) -> list[dict]:
+    """日频序列：收盘后若最新日落后于 end，丢掉缓存再取一次。"""
+    rows = _cached(name, fetch)
+    if not _need_today_bar(end):
+        return rows
+    if _latest_trade_ymd(rows) >= end:
+        return rows
+    cache.delete(f"market_tape:{name}")
+    return _cached(name, fetch)
 
 
 def _memory_or_disk(name: str, key: str):
@@ -1550,19 +1708,40 @@ def _parallel(items, fetch):
         return list(pool.map(fetch, items))
 
 
+def _share_expect_ymd(today: date) -> str:
+    """fund_share 正常 T+1：收盘后只强求追到上一交易日，不要求当天份额。"""
+    opens = _open_dates(today, 6)
+    if not opens:
+        return _ymd(today)
+    today_s = _ymd(today)
+    if today_s in opens:
+        idx = opens.index(today_s)
+        return opens[idx - 1] if idx > 0 else opens[0]
+    return opens[-1]
+
+
 def fund_share_rows(code: str, today: date, days: int = 400) -> list[dict]:
     """宽基、国家队、板块共用同一段份额，避免同一只 ETF 按不同窗口各取一次。"""
     start = _ymd_offset(today, days)
-    return _cached(f"fdshare:{code}:{start}", lambda c=code, s=start: _pro().fund_share(
-        ts_code=c, start_date=s, end_date=_ymd(today),
-    ))
+    end = _ymd(today)
+    expect = _share_expect_ymd(today)
+    return _cached_through(
+        f"fdshare:{code}:{start}:{end}",
+        expect,
+        lambda c=code, s=start, e=end: _pro().fund_share(ts_code=c, start_date=s, end_date=e),
+    )
 
 
 def fund_bar_rows(code: str, today: date, days: int = 400) -> list[dict]:
     start = _ymd_offset(today, days)
-    return _cached(f"fdbar:{code}:{start}", lambda c=code, s=start: _pro().fund_daily(
-        ts_code=c, start_date=s, end_date=_ymd(today), fields="ts_code,trade_date,close,pct_chg,vol,amount",
-    ))
+    end = _ymd(today)
+    return _cached_through(
+        f"fdbar:{code}:{start}:{end}",
+        end,
+        lambda c=code, s=start, e=end: _pro().fund_daily(
+            ts_code=c, start_date=s, end_date=e, fields="ts_code,trade_date,close,pct_chg,vol,amount",
+        ),
+    )
 
 
 def _cached_value(name: str):
