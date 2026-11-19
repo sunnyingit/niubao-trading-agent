@@ -90,13 +90,35 @@ _KNOWN_INDEXES = (
 )
 
 
+def _explicit_hk_query(text: str) -> bool:
+    """用户明确在找港股时，才不把 A 股排到前面。"""
+    raw = text.strip()
+    upper = raw.upper()
+    if ".HK" in upper or upper.endswith("HK"):
+        return True
+    if any(tok in raw for tok in ("港股", "港股通", "恒生", "H股", "H 股")):
+        return True
+    return bool(_HK_CODE_QUERY.fullmatch(raw))
+
+
+def _market_rank(ts_code: str, prefer_a: bool) -> int:
+    if not prefer_a:
+        return 0
+    suffix = (ts_code or "").upper().rsplit(".", 1)[-1]
+    if suffix in ("SH", "SZ", "BJ"):
+        return 0
+    if suffix == "HK":
+        return 2
+    return 1
+
+
 def search(
     query: str,
     limit: int = 8,
     listed: Callable[[], list[dict]] | None = None,
     hk_listed: Callable[[], list[dict]] | None = None,
 ) -> list[dict]:
-    """按名称包含、或代码前缀匹配。名称开头匹配的排在前面。A 股、港股和常见指数放在同一个结果里。"""
+    """按名称包含、或代码前缀匹配。名称开头匹配的排在前面。A 股、港股和常见指数放在同一个结果里；默认 A 股优先于港股。"""
     text = query.strip()
     if not text:
         return []
@@ -105,6 +127,7 @@ def search(
     if hk_listed is None:
         from app.tools.stock import _hk_stocks as hk_listed
     upper = text.upper()
+    prefer_a = not _explicit_hk_query(text)
     pool = list(listed())
     try:
         pool.extend(hk_listed())
@@ -127,9 +150,9 @@ def search(
             rank = 0
         else:
             continue
-        rows.append((rank, ts_code, {"ts_code": ts_code, "code": symbol or ts_code.split(".")[0], "name": name, "industry": row.get("industry")}))
-    rows.sort(key=lambda item: (item[0], item[1]))
-    return [item[2] for item in rows[:limit]]
+        rows.append((rank, _market_rank(ts_code, prefer_a), ts_code, {"ts_code": ts_code, "code": symbol or ts_code.split(".")[0], "name": name, "industry": row.get("industry")}))
+    rows.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in rows[:limit]]
 
 
 def _code_match(symbol: str, ts_code: str, text: str, upper: str) -> bool:
